@@ -74,9 +74,6 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 
 ## 安全 / 脱敏说明
 
-- 仓库不包含真实 `TELEGRAM_BOT_TOKEN`、`ADMIN_CHAT_ID`、面板密码、Session Secret、数据库、日志。
-- 真实配置放在 `.env`，不要提交。
-- `.gitignore` 已忽略 `.env`、SQLite、日志、虚拟环境和缓存。
 - 如果要把面板暴露到公网，建议使用 Cloudflare Access / 反代鉴权，并使用强密码。
 - Bot 只能给“已经主动私聊过 Bot 的用户”发消息，这是 Telegram Bot API 的限制。
 
