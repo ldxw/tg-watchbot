@@ -80,7 +80,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 ## 快速开始
 
 ```bash
-git clone <YOUR_REPO_URL> tg-watchbot
+git clone https://github.com/GongyiChuren/tg-watchbot.git tg-watchbot
 cd tg-watchbot
 python3 -m venv .venv
 ./.venv/bin/pip install -U pip
