@@ -164,7 +164,7 @@ http://127.0.0.1:8765
 密码：change-me
 ```
 
-如果要从公网访问面板，推荐用 Cloudflare Tunnel + Zero Trust Access，不需要开放服务器入站端口，也不用把 `WEB_PANEL_HOST` 改成 `0.0.0.0`。
+如果要从公网访问面板，推荐用 Cloudflare Tunnel + Zero Trust Access（需要域名），不需要开放服务器入站端口，也不用把 `WEB_PANEL_HOST` 改成 `0.0.0.0`。
 
 基本步骤：
 
