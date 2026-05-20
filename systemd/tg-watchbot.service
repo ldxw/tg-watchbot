@@ -1,0 +1,22 @@
+[Unit]
+Description=tg-watchbot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tg-watchbot
+EnvironmentFile=/opt/tg-watchbot/.env
+ExecStart=/opt/tg-watchbot/.venv/bin/python /opt/tg-watchbot/app.py
+Restart=on-failure
+RestartSec=10
+User=tg-watchbot
+Group=tg-watchbot
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/tg-watchbot
+
+[Install]
+WantedBy=multi-user.target

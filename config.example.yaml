@@ -1,0 +1,47 @@
+http:
+  timeout_seconds: 20
+  user_agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko)
+    Chrome/124.0 Safari/537.36 tg-watchbot/1.0
+bot:
+  rate_limit:
+    window_seconds: 10
+    max_messages: 3
+monitors:
+- name: NodeSeek 新帖
+  type: rss
+  url: https://rss.nodeseek.com/
+  interval_seconds: 60
+  keywords:
+  - VPS
+  - 优惠
+  - 免费
+  exclude_keywords: []
+  authors: []
+  categories: []
+  notify_on:
+    keyword_match: true
+    new_item: true
+    price_change: false
+    stock_change: false
+  forum: true
+- name: Linux.do 最新
+  type: rss
+  url: https://linux.do/latest.rss
+  interval_seconds: 60
+  keywords:
+  - API
+  - 教程
+  - 开源
+  exclude_keywords: []
+  authors: []
+  categories: []
+  notify_on:
+    keyword_match: true
+    new_item: true
+    price_change: false
+    stock_change: false
+  forum: true
+cleanup:
+  enabled: true
+  interval_minutes: 60
+  monitor_retention_minutes: 1440
