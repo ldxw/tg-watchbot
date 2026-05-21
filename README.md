@@ -87,7 +87,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 自动清理监控/RSS/网站状态数据；支持定时删除 Telegram 监控通知消息；不会删除用户、收件箱、双向对话消息。
 - 日志页面和健康检查 `/health`。
 
-![示例图片](https://pic.gongyichuren.de/file/1779304138340_40dc85909b22767a56dedb3721be6e47.png)
+![示例图片](https://pic.gongyichuren.de/file/1779345259571_image.png)
 
 ## 使用的开源库
 
