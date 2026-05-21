@@ -176,6 +176,14 @@ class MonitorMessageCleanupTest(unittest.TestCase):
             row = conn.execute("SELECT direction, source, text, forwarded FROM inbox_messages WHERE id=?", (outbox_id,)).fetchone()
         self.assertEqual(("out", "web:inbox", "reply text", 1), (row["direction"], row["source"], row["text"], row["forwarded"]))
 
+    def test_save_message_map_supports_message_id_only_payload(self) -> None:
+        app.save_message_map(1001, 3003, 2001, 4004)
+        with closing(sqlite3.connect(app.DB_PATH)) as conn:
+            row = conn.execute(
+                "SELECT admin_chat_id, admin_message_id, user_id, user_message_id FROM message_map"
+            ).fetchone()
+        self.assertEqual((1001, 3003, 2001, 4004), row)
+
     def test_expired_monitor_message_is_deleted_and_removed_from_queue(self) -> None:
         sent_message = SimpleNamespace(chat=SimpleNamespace(id=1001), message_id=2002)
         app.record_monitor_message(sent_message, "NodeSeek 新帖", delete_after_seconds=60, sent_at_ts=1000)

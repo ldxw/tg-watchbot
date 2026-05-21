@@ -284,11 +284,11 @@ def rate_limited(user_id: int) -> bool:
     return len(bucket) > max_messages
 
 
-def save_message_map(admin_msg: Message, user_id: int, user_message_id: int | None) -> None:
+def save_message_map(admin_chat_id: int, admin_message_id: int, user_id: int, user_message_id: int | None) -> None:
     with closing(db()) as conn:
         conn.execute(
             "INSERT OR REPLACE INTO message_map(admin_chat_id, admin_message_id, user_id, user_message_id, created_at) VALUES(?,?,?,?,?)",
-            (admin_msg.chat.id, admin_msg.message_id, user_id, user_message_id, now_iso()),
+            (admin_chat_id, admin_message_id, user_id, user_message_id, now_iso()),
         )
         conn.commit()
 
@@ -783,9 +783,9 @@ async def user_message(message: Message) -> None:
         first_copy_id = None
         for chat_id in all_admin_chat_ids():
             sent = await bot.send_message(chat_id, header)  # type: ignore[union-attr]
-            save_message_map(sent, uid, message.message_id)
+            save_message_map(chat_id, sent.message_id, uid, message.message_id)
             copied = await message.copy_to(chat_id, reply_to_message_id=sent.message_id)  # type: ignore[arg-type]
-            save_message_map(copied, uid, message.message_id)
+            save_message_map(chat_id, copied.message_id, uid, message.message_id)
             first_header_id = first_header_id or sent.message_id
             first_copy_id = first_copy_id or copied.message_id
         mark_inbox_forwarded(inbox_id, first_header_id, first_copy_id)
@@ -1161,7 +1161,7 @@ async def flush_pending_inbox() -> None:
             first_id = None
             for chat_id in all_admin_chat_ids():
                 sent = await bot.send_message(chat_id, text)
-                save_message_map(sent, int(row['user_id']), int(row['user_message_id']) if row['user_message_id'] else None)
+                save_message_map(chat_id, sent.message_id, int(row['user_id']), int(row['user_message_id']) if row['user_message_id'] else None)
                 first_id = first_id or sent.message_id
             mark_inbox_forwarded(int(row['id']), first_id, None)
         except Exception as e:
