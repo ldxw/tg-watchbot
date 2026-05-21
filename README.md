@@ -26,21 +26,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 <a id="ai-one-line-install"></a>
 ## AI 一句话安装
 
-```bash
-bash -lc 'git clone https://github.com/GongyiChuren/tg-watchbot.git tg-watchbot && cd tg-watchbot && cp -n .env.example .env && cp -n config.example.yaml config.yaml && touch tg-watchbot.sqlite3 tg-watchbot.log && docker compose up -d --build'
-```
-
-说明：默认走 Docker（`restart: unless-stopped`，重启后自动拉起）。首次启动后打开 `http://127.0.0.1:8765`，在面板里填写 Token / 管理员 ID，保存后重启容器生效：
-
-```bash
-docker compose restart
-```
-
-### AI 一句话直接安装（非 Docker）
-
-```bash
-bash -lc 'git clone https://github.com/GongyiChuren/tg-watchbot.git tg-watchbot && cd tg-watchbot && python3 -m venv .venv && ./.venv/bin/pip install -U pip && ./.venv/bin/pip install -r requirements.txt && cp -n .env.example .env && cp -n config.example.yaml config.yaml && ./.venv/bin/python app.py'
-```
+请克隆 `https://github.com/GongyiChuren/tg-watchbot.git` 到本机，默认使用 Docker 按 README 的 `Docker 安装（含自启）` 启动服务；若无 Docker，则按 `快速开始` 走 Python 直接安装。启动后打开 `http://127.0.0.1:8765`，在面板填写 `TELEGRAM_BOT_TOKEN` 和 `ADMIN_CHAT_ID`，保存后执行重启（Docker 用 `docker compose restart`，直接安装用重启进程）。
 
 ## 更新日志
 
