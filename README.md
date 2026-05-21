@@ -1,16 +1,5 @@
-# tg-watchbot
-
-tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器人** 和 **Web/RSS 监控推送** 合在一起：
-
-- 普通用户私聊 Bot，消息会转发给管理员；
-- 管理员可以直接回复、主动发文字/图片、封禁/备注用户；
-- 后台定时监控 RSS 或网页，命中关键词、新条目、价格/库存变化后推送给管理员；
-- 自带一个 Web 管理面板，可配置监控目标、编辑 YAML、查看收件箱和日志。
-
-项目为单文件应用，适合个人服务器、NAT 小鸡、轻量 VPS 直接用 systemd 跑。
-
 <div align="center">
-  <h2>tg-watchbot</h2>
+  <h1>tg-watchbot</h1>
   <p>Telegram 双向客服机器人 + Web/RSS 监控推送 + 可视化管理面板</p>
   <p>双向对话 · 关键词监控 · 私聊广告拦截 · 多管理员 · 配置导入导出</p>
   <p>
@@ -23,7 +12,17 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
   </p>
 </div>
 
+## 简介：
+tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器人** 和 **Web/RSS 监控推送** 合在一起：
+
+- 普通用户私聊 Bot，消息会转发给管理员；
+- 管理员可以直接回复、主动发文字/图片、封禁/备注用户；
+- 后台定时监控 RSS 或网页，命中关键词、新条目、价格/库存变化后推送给管理员；
+- 自带一个 Web 管理面板，可配置监控目标、编辑 YAML、查看收件箱和日志。
+
+项目为单文件应用，适合个人服务器、NAT 小鸡、轻量 VPS 直接用 systemd 跑。
 <a id="ai-one-line-install"></a>
+
 ## AI 一句话安装
 
 请克隆 `https://github.com/GongyiChuren/tg-watchbot.git` 到本机，默认使用 Docker 按 README 的 `Docker 安装（含自启）` 启动服务；若无 Docker，则按 `快速开始` 走 Python 直接安装。启动后打开 `http://127.0.0.1:8765`，在面板填写 `TELEGRAM_BOT_TOKEN` 和 `ADMIN_CHAT_ID`，保存后执行重启（Docker 用 `docker compose restart`，直接安装用重启进程）。
