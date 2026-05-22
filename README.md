@@ -29,6 +29,19 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 ``` 
 ## 更新日志
 
+### 2026-05-22 更新
+
+- TG 群监听功能增强：支持可视化配置监听规则、AI 总结参数与防刷屏策略。
+- TG 群监听新增“已发现群聊”：自动显示 Bot 收到过消息的群聊 `chat_id`，可一键创建监听。
+- TG 群监听新增“监听来源”选项：`Bot` / `用户会话`（可用于 Bot 无法加入的群）。
+- 设置页新增 `TG_API_ID`、`TG_API_HASH`、`TG_API_SESSION` 可视化配置；用于用户会话监听。
+- 新增 `/update` 安全更新流程：显示本地/远端 commit、ahead/behind、工作区状态；仅允许 `ff-only` 更新。
+- 更新前若检测到本地未提交改动，会拒绝更新；避免覆盖本地代码。
+- 新增“回滚上次更新”按钮：更新前自动记录回滚点，可一键回滚并重启。
+- TG 群监听 AI 总结新增可视化高级控制：`ai_prompt`、`ai_min_interval_seconds`、`ai_dedupe_window_seconds`。
+- TG 群监听增加限频和去重窗口，降低重复推送与 AI 调用成本；AI 失败时仍会回退模板摘要。
+- 监控面板新增可观测状态：最近成功/失败时间、最近错误、耗时、推送数、连续失败次数。
+
 ### 2026-05-21 第二次更新
 
 - Web 面板新增收件箱直接回复、用户管理、快捷回复、私聊广告拦截、监控推送历史、配置导入/导出。
@@ -106,6 +119,8 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 日志页面和健康检查 `/health`。
 
 ![示例图片](https://pic.gongyichuren.de/file/1779345259571_image.png)
+![新版面板截图](https://pic.gongyichuren.de/file/1779437104636_image.png)
+![新版群监听截图](https://pic.gongyichuren.de/file/1779437050727_image.png)
 
 ## 使用的开源库
 
@@ -127,7 +142,6 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 如果要把面板暴露到公网，建议使用 Cloudflare Access / 反代鉴权，并使用强密码。
 - Bot 只能给“已经主动私聊过 Bot 的用户”发消息，这是 Telegram Bot API 的限制。
 
-<a id="manual-install"></a>
 ## 快速开始
 
 <a id="docker-install"></a>
@@ -156,6 +170,9 @@ docker compose logs -f
 ```bash
 docker compose restart
 ```
+
+<a id="manual-install"></a>
+## 手动安装（Python）
 
 ```bash
 git clone https://github.com/GongyiChuren/tg-watchbot.git tg-watchbot
@@ -286,6 +303,9 @@ curl http://127.0.0.1:8765/health
 | `WEB_PANEL_USER` | 面板用户名 |
 | `WEB_PANEL_PASSWORD` | 面板密码 |
 | `WEB_PANEL_SESSION_SECRET` | Session Secret，留空会自动生成并写回 `.env` |
+| `TG_API_ID` | （可选）Telegram API ID，用于“TG 群监听=用户会话” |
+| `TG_API_HASH` | （可选）Telegram API Hash，用于“TG 群监听=用户会话” |
+| `TG_API_SESSION` | （可选）Telethon StringSession，用于“TG 群监听=用户会话” |
 
 ### `config.yaml`
 
@@ -307,6 +327,54 @@ bot:
     - title: 已收到
       text: 你好，消息已收到，我稍后处理。
 ```
+
+TG 群关键词监听（可选，默认关闭）：
+
+```yaml
+group_monitors:
+  - name: TG 群关键词监听
+    enabled: false
+    listen_source: bot
+    chat_id: -1001234567890
+    keywords:
+      - VPS
+      - 优惠
+    exclude_keywords:
+      - 求带
+    notify_telegram: true
+    summary_mode: template
+    ai_base_url: ""
+    ai_api_key: ""
+    ai_model: gpt-4o-mini
+    ai_interface: responses
+    ai_temperature: 0.2
+    ai_timeout_seconds: 30
+    ai_prompt: ""
+    ai_min_interval_seconds: 30
+    ai_dedupe_window_seconds: 300
+```
+
+- 命中 `keywords` 且未命中 `exclude_keywords` 时，会给管理员发送摘要。
+- TG 群监听页面会展示“已发现群聊”（Bot 收到过消息的群），可直接点“用此群创建监听”自动填入 `chat_id`。
+- `listen_source` 支持：
+  - `bot`：默认，使用 Bot 接收群消息（需把 Bot 拉进群）
+  - `user_session`：使用用户会话接收群消息（适合 Bot 无法入群）
+- `summary_mode` 支持：
+  - `template`：固定模板摘要（默认）
+  - `ai`：调用 AI 生成摘要（在 TG 群监听页面可视化配置）
+- `ai_prompt` 可填自定义总结提示词；留空使用内置默认提示词。
+- `ai_interface` 支持：
+  - `responses`：`/v1/responses`
+  - `chat`：`/v1/chat/completions`
+- `ai_min_interval_seconds`：同一个群监听最小推送间隔（防刷屏）
+- `ai_dedupe_window_seconds`：相同内容摘要去重窗口（防重复）
+- 机器人想收到群里普通消息，需要在 `@BotFather` 执行 `/setprivacy` 关闭隐私模式。
+- 若使用 `listen_source=user_session`，需在设置页填写 `TG_API_ID`、`TG_API_HASH`、`TG_API_SESSION` 后重启。
+
+更新代码（`/update`）已支持安全检查：
+- 显示本地/远端 commit、ahead/behind、工作区是否干净
+- 只允许 `ff-only` 更新，工作区有未提交改动会拒绝更新
+- 自动记录上次更新前的回滚点，并支持一键回滚
 
 监控数据自动清理示例：
 

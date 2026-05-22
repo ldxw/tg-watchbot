@@ -17,14 +17,16 @@ import os
 import re
 import secrets
 import signal
+import subprocess
 import sqlite3
 import time
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import quote_plus, urljoin
 
 import feedparser
 import httpx
@@ -43,6 +45,14 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, st
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 import uvicorn
 
+try:
+    from telethon import TelegramClient, events
+    from telethon.sessions import StringSession
+except Exception:  # pragma: no cover - optional dependency
+    TelegramClient = None
+    events = None
+    StringSession = None
+
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "tg-watchbot.sqlite3"
 CONFIG_PATH = BASE_DIR / "config.yaml"
@@ -50,6 +60,8 @@ ENV_PATH = BASE_DIR / ".env"
 LOG_PATH = BASE_DIR / "tg-watchbot.log"
 MIN_INTERVAL_SECONDS = 60
 DEFAULT_MONITOR_MESSAGE_DELETE_AFTER_MINUTES = 60
+DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS = 30
+DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS = 300
 
 DEFAULT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -65,6 +77,9 @@ config: dict[str, Any] = {}
 rate_buckets: dict[int, list[float]] = {}
 pending_sendpic: dict[int, dict[str, Any]] = {}
 scheduler_ref: AsyncIOScheduler | None = None
+user_session_listener_task: asyncio.Task | None = None
+user_session_client: Any = None
+GROUP_SUMMARY_MAX_CHARS = 800
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -181,6 +196,39 @@ def init_db() -> None:
                 reasons TEXT,
                 pushed INTEGER DEFAULT 0,
                 created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS monitor_runtime_status (
+                monitor_name TEXT PRIMARY KEY,
+                last_run_at TEXT,
+                last_success_at TEXT,
+                last_error_at TEXT,
+                last_error TEXT,
+                last_duration_ms INTEGER DEFAULT 0,
+                last_sent_count INTEGER DEFAULT 0,
+                consecutive_failures INTEGER DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS group_monitor_recent (
+                monitor_name TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                sent_at_ts REAL NOT NULL,
+                PRIMARY KEY (monitor_name, fingerprint)
+            );
+            CREATE TABLE IF NOT EXISTS group_monitor_last_send (
+                monitor_name TEXT PRIMARY KEY,
+                sent_at_ts REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS app_meta (
+                meta_key TEXT PRIMARY KEY,
+                meta_value TEXT,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS discovered_group_chats (
+                chat_id INTEGER PRIMARY KEY,
+                title TEXT,
+                username TEXT,
+                last_seen_at TEXT NOT NULL,
+                active INTEGER DEFAULT 1
             );
             """
         )
@@ -372,6 +420,486 @@ def spam_keyword_hits(text: str) -> list[str]:
     return keyword_hits(text, settings["keywords"])
 
 
+def ai_api_url(base_url: str, path: str) -> str:
+    base = base_url.strip().rstrip("/")
+    if not base:
+        return path
+    if base.endswith("/v1"):
+        return base + path
+    if path.startswith("/v1"):
+        return base + path
+    return base + "/v1" + path
+
+
+def group_monitors() -> list[dict[str, Any]]:
+    if not isinstance(config, dict):
+        return []
+    rows = config.get("group_monitors") or []
+    if not isinstance(rows, list):
+        return []
+    monitors: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if not row.get("enabled", True):
+            continue
+        try:
+            chat_id = int(row.get("chat_id"))
+        except (TypeError, ValueError):
+            continue
+        summary_mode = str(row.get("summary_mode") or "template").strip().lower()
+        if summary_mode not in {"template", "ai"}:
+            summary_mode = "template"
+        ai_interface = str(row.get("ai_interface") or "responses").strip().lower() or "responses"
+        if ai_interface not in {"responses", "chat"}:
+            ai_interface = "responses"
+        listen_source = str(row.get("listen_source") or "bot").strip().lower() or "bot"
+        if listen_source not in {"bot", "user_session"}:
+            listen_source = "bot"
+        keywords = [str(k).strip() for k in (row.get("keywords") or []) if str(k).strip()]
+        exclude_keywords = [str(k).strip() for k in (row.get("exclude_keywords") or []) if str(k).strip()]
+        monitors.append(
+            {
+                "name": str(row.get("name") or str(chat_id)),
+                "chat_id": chat_id,
+                "listen_source": listen_source,
+                "summary_mode": summary_mode,
+                "keywords": keywords,
+                "exclude_keywords": exclude_keywords,
+                "notify_telegram": bool(row.get("notify_telegram", True)),
+                "ai_base_url": str(row.get("ai_base_url") or "").strip(),
+                "ai_api_key": str(row.get("ai_api_key") or "").strip(),
+                "ai_model": str(row.get("ai_model") or "gpt-4o-mini").strip(),
+                "ai_interface": ai_interface,
+                "ai_temperature": safe_float(row.get("ai_temperature", 0.2), 0.2),
+                "ai_timeout_seconds": max(1, safe_int(row.get("ai_timeout_seconds", 30), 30)),
+                "ai_prompt": str(row.get("ai_prompt") or "").strip(),
+                "ai_min_interval_seconds": max(
+                    0,
+                    safe_int(
+                        row.get("ai_min_interval_seconds", DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS),
+                        DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS,
+                    ),
+                ),
+                "ai_dedupe_window_seconds": max(
+                    0,
+                    safe_int(
+                        row.get("ai_dedupe_window_seconds", DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS),
+                        DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS,
+                    ),
+                ),
+            }
+        )
+    return monitors
+
+
+def group_monitor_for_chat(chat_id: int) -> dict[str, Any] | None:
+    for monitor in group_monitors():
+        if int(monitor["chat_id"]) == int(chat_id):
+            return monitor
+    return None
+
+
+def group_monitor_for_chat_and_source(chat_id: int, listen_source: str) -> dict[str, Any] | None:
+    source = (listen_source or "bot").strip().lower() or "bot"
+    for monitor in group_monitors():
+        if int(monitor["chat_id"]) != int(chat_id):
+            continue
+        if str(monitor.get("listen_source") or "bot") == source:
+            return monitor
+    return None
+
+
+def group_monitors_need_user_session() -> bool:
+    for monitor in group_monitors():
+        if str(monitor.get("listen_source") or "bot") == "user_session":
+            return True
+    return False
+
+
+def user_session_config() -> tuple[str, str, str]:
+    load_dotenv(ENV_PATH, override=True)
+    api_id = os.getenv("TG_API_ID", "").strip()
+    api_hash = os.getenv("TG_API_HASH", "").strip()
+    session = os.getenv("TG_API_SESSION", "").strip()
+    return api_id, api_hash, session
+
+
+def user_session_ready() -> bool:
+    api_id, api_hash, session = user_session_config()
+    if not api_id or not api_hash:
+        return False
+    if not session:
+        return False
+    try:
+        int(api_id)
+    except Exception:
+        return False
+    return True
+
+
+def group_message_text(message: Message) -> str:
+    parts = [message.text or "", message.caption or ""]
+    if getattr(message, "reply_to_message", None):
+        reply = message.reply_to_message
+        parts.extend([getattr(reply, "text", "") or "", getattr(reply, "caption", "") or ""])
+    merged = " ".join([p.strip() for p in parts if p and str(p).strip()])
+    return merged.strip()
+
+
+def group_message_context(message: Message, monitor: dict[str, Any], hits: list[str]) -> str:
+    chat_title = getattr(message.chat, "title", "") or str(message.chat.id)
+    username = getattr(message.from_user, "username", None)
+    user_full = " ".join(
+        x for x in [getattr(message.from_user, "first_name", ""), getattr(message.from_user, "last_name", "")] if x
+    ).strip() or str(getattr(message.from_user, "id", "unknown"))
+    sender = f"{user_full} (@{username})" if username else user_full
+    reply_text = ""
+    if getattr(message, "reply_to_message", None):
+        reply = message.reply_to_message
+        reply_text = group_message_text(reply)[:GROUP_SUMMARY_MAX_CHARS]
+    text = group_message_text(message)
+    if len(text) > GROUP_SUMMARY_MAX_CHARS:
+        text = text[:GROUP_SUMMARY_MAX_CHARS] + "..."
+    return (
+        f"群名: {chat_title}\n"
+        f"群ID: {message.chat.id}\n"
+        f"群用户名: @{getattr(message.chat, 'username', '') or ''}\n"
+        f"发送者: {sender}\n"
+        f"发送者ID: {getattr(message.from_user, 'id', 'unknown')}\n"
+        f"消息ID: {message.message_id}\n"
+        f"时间: {now_iso()}\n"
+        f"命中关键词: {', '.join(hits) or '-'}\n"
+        f"消息类型: {message.content_type}\n"
+        f"正文:\n{text or '(非文本消息)'}\n"
+        f"回复引用:\n{reply_text or '-'}\n"
+        f"链接: {telegram_message_link(getattr(message.chat, 'username', None), int(message.chat.id), int(message.message_id))}\n"
+        f"监听名称: {monitor.get('name') or chat_title}"
+    )
+
+
+def telegram_message_link(chat_username: str | None, chat_id: int, message_id: int) -> str:
+    if chat_username:
+        return f"https://t.me/{chat_username}/{message_id}"
+    chat_num = str(chat_id)
+    if chat_num.startswith("-100") and len(chat_num) > 4:
+        return f"https://t.me/c/{chat_num[4:]}/{message_id}"
+    return f"chat_id={chat_id} message_id={message_id}"
+
+
+def extract_responses_text(data: dict[str, Any]) -> str:
+    text = data.get("output_text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    chunks: list[str] = []
+    for item in data.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        for part in item.get("content") or []:
+            if not isinstance(part, dict):
+                continue
+            value = part.get("text") or part.get("content")
+            if isinstance(value, str) and value.strip():
+                chunks.append(value.strip())
+    return "\n".join(chunks).strip()
+
+
+def extract_chat_text(data: dict[str, Any]) -> str:
+    choices = data.get("choices") or []
+    if not choices:
+        return ""
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            value = part.get("text") or part.get("content")
+            if isinstance(value, str) and value.strip():
+                chunks.append(value.strip())
+        return "\n".join(chunks).strip()
+    return ""
+
+
+def build_group_ai_system_prompt(custom_prompt: str) -> str:
+    base = (
+        "你是 Telegram 群消息摘要助手。"
+        "请用简体中文输出一段给管理员看的消息摘要，尽量完整，保留群名、发送者、命中词、正文关键内容、时间和链接。"
+        "不要编造，不要添加未出现的信息。"
+        "如果正文很长，请压缩成可快速扫读的摘要，但不要丢掉数字、价格、链接、联系方式和结论。"
+    )
+    custom = (custom_prompt or "").strip()
+    if not custom:
+        return base
+    return base + "\n补充要求：\n" + custom
+
+
+def build_group_ai_prompt(message: Message, monitor: dict[str, Any], hits: list[str]) -> tuple[str, str]:
+    system = build_group_ai_system_prompt(str(monitor.get("ai_prompt") or ""))
+    user = group_message_context(message, monitor, hits)
+    return system, user
+
+
+async def summarize_group_message_ai(message: Message, monitor: dict[str, Any], hits: list[str]) -> str | None:
+    ai_base_url = str(monitor.get("ai_base_url") or "").strip()
+    ai_api_key = str(monitor.get("ai_api_key") or "").strip()
+    ai_model = str(monitor.get("ai_model") or "gpt-4o-mini").strip()
+    ai_interface = str(monitor.get("ai_interface") or "responses").strip().lower()
+    ai_timeout = max(1, int(monitor.get("ai_timeout_seconds") or 30))
+    ai_temperature = float(monitor.get("ai_temperature") or 0.2)
+    if not ai_base_url or not ai_api_key or not ai_model:
+        return None
+    system_prompt, user_prompt = build_group_ai_prompt(message, monitor, hits)
+    headers = {"Authorization": f"Bearer {ai_api_key}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=ai_timeout, headers=headers) as client:
+        if ai_interface == "chat":
+            payload = {
+                "model": ai_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": ai_temperature,
+            }
+            resp = await client.post(ai_api_url(ai_base_url, "/chat/completions"), json=payload)
+            resp.raise_for_status()
+            return extract_chat_text(resp.json())
+        payload = {
+            "model": ai_model,
+            "instructions": system_prompt,
+            "input": user_prompt,
+            "temperature": ai_temperature,
+            "max_output_tokens": 300,
+        }
+        resp = await client.post(ai_api_url(ai_base_url, "/responses"), json=payload)
+        resp.raise_for_status()
+        return extract_responses_text(resp.json())
+
+
+def summarize_group_message_template(message: Message, monitor: dict[str, Any], hits: list[str]) -> str:
+    chat_title = getattr(message.chat, "title", "") or str(message.chat.id)
+    username = getattr(message.from_user, "username", None)
+    user_full = " ".join(
+        x for x in [getattr(message.from_user, "first_name", ""), getattr(message.from_user, "last_name", "")] if x
+    ).strip() or str(getattr(message.from_user, "id", "unknown"))
+    sender = f"{user_full} (@{username})" if username else user_full
+    text = group_message_text(message)
+    if len(text) > GROUP_SUMMARY_MAX_CHARS:
+        text = text[:GROUP_SUMMARY_MAX_CHARS] + "..."
+    return (
+        f"[群关键词命中] {html_escape(str(monitor.get('name') or chat_title))}\n"
+        f"群：{html_escape(chat_title)} ({message.chat.id})\n"
+        f"发送者：{html_escape(sender)}\n"
+        f"命中：{html_escape(', '.join(hits))}\n"
+        f"时间：{html_escape(now_iso())}\n"
+        f"链接：{html_escape(telegram_message_link(getattr(message.chat, 'username', None), int(message.chat.id), int(message.message_id)))}\n"
+        f"内容：\n{html_escape(text or '(非文本消息)')}"
+    )
+
+
+async def summarize_group_message(message: Message, monitor: dict[str, Any], hits: list[str]) -> str:
+    if str(monitor.get("summary_mode") or "template").strip().lower() != "ai":
+        return summarize_group_message_template(message, monitor, hits)
+    try:
+        text = await summarize_group_message_ai(message, monitor, hits)
+        if text:
+            return f"[群AI总结] {html_escape(str(monitor.get('name') or message.chat.id))}\n{html_escape(text.strip())}"
+        logger.warning("group ai summary returned empty result chat_id=%s message_id=%s", message.chat.id, message.message_id)
+    except Exception:
+        logger.exception("group ai summary failed chat_id=%s message_id=%s", message.chat.id, message.message_id)
+    return "[群AI总结失败，已使用模板]\n" + summarize_group_message_template(message, monitor, hits)
+
+
+def build_group_summary(message: Message, monitor: dict[str, Any], hits: list[str]) -> str:
+    return summarize_group_message_template(message, monitor, hits)
+
+
+def group_monitor_interval_seconds(monitor: dict[str, Any]) -> int:
+    return max(0, safe_int(monitor.get("ai_min_interval_seconds"), DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS))
+
+
+def group_monitor_dedupe_window_seconds(monitor: dict[str, Any]) -> int:
+    return max(0, safe_int(monitor.get("ai_dedupe_window_seconds"), DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS))
+
+
+def group_monitor_fingerprint(message: Message, monitor: dict[str, Any], hits: list[str]) -> str:
+    payload = "|".join(
+        [
+            str(monitor.get("name") or ""),
+            str(message.chat.id),
+            str(getattr(message.from_user, "id", "")),
+            ",".join(sorted(hits)),
+            group_message_text(message)[:300],
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def group_monitor_allow_send(monitor: dict[str, Any], fingerprint: str, now_ts: float | None = None) -> tuple[bool, str]:
+    ts = time.time() if now_ts is None else float(now_ts)
+    name = str(monitor.get("name") or monitor.get("chat_id") or "group-monitor")
+    min_interval = group_monitor_interval_seconds(monitor)
+    dedupe_window = group_monitor_dedupe_window_seconds(monitor)
+    with closing(db()) as conn:
+        if min_interval > 0:
+            row = conn.execute(
+                "SELECT sent_at_ts FROM group_monitor_last_send WHERE monitor_name=?",
+                (name,),
+            ).fetchone()
+            if row and (ts - float(row["sent_at_ts"]) < min_interval):
+                return False, f"min-interval({min_interval}s)"
+        if dedupe_window > 0:
+            row = conn.execute(
+                "SELECT sent_at_ts FROM group_monitor_recent WHERE monitor_name=? AND fingerprint=?",
+                (name, fingerprint),
+            ).fetchone()
+            if row and (ts - float(row["sent_at_ts"]) < dedupe_window):
+                return False, f"dedupe({dedupe_window}s)"
+        if dedupe_window > 0:
+            conn.execute(
+                "DELETE FROM group_monitor_recent WHERE sent_at_ts < ?",
+                (ts - dedupe_window,),
+            )
+        conn.execute(
+            """
+            INSERT INTO group_monitor_recent(monitor_name, fingerprint, sent_at_ts)
+            VALUES(?,?,?)
+            ON CONFLICT(monitor_name, fingerprint) DO UPDATE SET sent_at_ts=excluded.sent_at_ts
+            """,
+            (name, fingerprint, ts),
+        )
+        conn.execute(
+            """
+            INSERT INTO group_monitor_last_send(monitor_name, sent_at_ts)
+            VALUES(?,?)
+            ON CONFLICT(monitor_name) DO UPDATE SET sent_at_ts=excluded.sent_at_ts
+            """,
+            (name, ts),
+        )
+        conn.commit()
+    return True, ""
+
+
+async def handle_group_keyword_message(message: Message, listen_source: str = "bot") -> bool:
+    monitor = group_monitor_for_chat_and_source(int(message.chat.id), listen_source)
+    if not monitor:
+        return False
+    text = group_message_text(message)
+    if not text:
+        return False
+    exclude_hits = keyword_hits(text, monitor.get("exclude_keywords") or [])
+    if exclude_hits:
+        return False
+    hits = keyword_hits(text, monitor.get("keywords") or [])
+    if not hits:
+        return False
+    if not monitor.get("notify_telegram", True):
+        return True
+    fp = group_monitor_fingerprint(message, monitor, hits)
+    allow, reason = group_monitor_allow_send(monitor, fp)
+    if not allow:
+        logger.info(
+            "group monitor skipped by limiter monitor=%s chat_id=%s message_id=%s reason=%s",
+            monitor.get("name"),
+            message.chat.id,
+            message.message_id,
+            reason,
+        )
+        return False
+    await admin_send(await summarize_group_message(message, monitor, hits))
+    return True
+
+
+def build_pseudo_message_from_user_session_event(event: Any) -> Any | None:
+    msg = getattr(event, "message", None)
+    if msg is None:
+        return None
+    try:
+        chat_id = int(getattr(event, "chat_id"))
+    except Exception:
+        return None
+    text = str(getattr(msg, "text", "") or getattr(msg, "message", "") or "").strip()
+    caption = str(getattr(msg, "caption", "") or "").strip()
+    content = text or caption
+    if not content:
+        return None
+    chat_title = str(getattr(getattr(event, "chat", None), "title", "") or str(chat_id))
+    chat_username = str(getattr(getattr(event, "chat", None), "username", "") or "")
+    sender_id = getattr(event, "sender_id", None)
+    from_user = SimpleNamespace(
+        id=int(sender_id) if sender_id is not None else 0,
+        first_name="",
+        last_name="",
+        username="",
+    )
+    return SimpleNamespace(
+        chat=SimpleNamespace(
+            id=chat_id,
+            type="supergroup" if str(chat_id).startswith("-100") else "group",
+            title=chat_title,
+            username=chat_username,
+        ),
+        from_user=from_user,
+        text=text or content,
+        caption=caption or None,
+        reply_to_message=None,
+        message_id=int(getattr(msg, "id", 0) or 0),
+        content_type="text",
+    )
+
+
+async def run_user_session_group_listener() -> None:
+    global user_session_client
+    if TelegramClient is None or StringSession is None:
+        logger.warning("user-session group listener skipped: telethon is not installed")
+        return
+    api_id_raw, api_hash, session = user_session_config()
+    if not api_id_raw or not api_hash or not session:
+        logger.warning("user-session group listener skipped: TG_API_ID/TG_API_HASH/TG_API_SESSION not complete")
+        return
+    try:
+        api_id = int(api_id_raw)
+    except Exception:
+        logger.warning("user-session group listener skipped: TG_API_ID must be integer")
+        return
+    try:
+        client = TelegramClient(StringSession(session), api_id, api_hash)
+        user_session_client = client
+
+        @client.on(events.NewMessage(incoming=True))  # type: ignore[misc]
+        async def on_new_group_message(event: Any) -> None:
+            if not (getattr(event, "is_group", False) or getattr(event, "is_channel", False)):
+                return
+            pseudo = build_pseudo_message_from_user_session_event(event)
+            if pseudo is None:
+                return
+            record_discovered_group_chat_data(
+                int(pseudo.chat.id),
+                str(getattr(pseudo.chat, "title", "") or pseudo.chat.id),
+                str(getattr(pseudo.chat, "username", "") or ""),
+            )
+            await handle_group_keyword_message(pseudo, listen_source="user_session")
+
+        await client.start()
+        logger.info("user-session group listener started")
+        await client.run_until_disconnected()
+    except asyncio.CancelledError:
+        logger.info("user-session group listener cancelled")
+        raise
+    except Exception:
+        logger.exception("user-session group listener crashed")
+    finally:
+        try:
+            if user_session_client is not None:
+                await user_session_client.disconnect()
+        except Exception:
+            logger.exception("user-session listener disconnect failed")
+        user_session_client = None
+
+
 def update_spam_keywords(action: str, word: str) -> list[str]:
     cfg = cfg_load_fresh()
     bot_cfg = cfg.setdefault("bot", {})
@@ -398,6 +926,121 @@ def record_monitor_event(monitor_name: str, title: str, link: str, reasons: list
             (monitor_name, title, link, "; ".join(reasons), 1 if pushed else 0, now_iso()),
         )
         conn.commit()
+
+
+def record_monitor_runtime(
+    monitor_name: str,
+    ok: bool,
+    duration_ms: int,
+    sent_count: int,
+    error: str = "",
+) -> None:
+    now = now_iso()
+    with closing(db()) as conn:
+        row = conn.execute(
+            "SELECT consecutive_failures FROM monitor_runtime_status WHERE monitor_name=?",
+            (monitor_name,),
+        ).fetchone()
+        prev_failures = int(row["consecutive_failures"]) if row else 0
+        failures = 0 if ok else (prev_failures + 1)
+        conn.execute(
+            """
+            INSERT INTO monitor_runtime_status(
+                monitor_name, last_run_at, last_success_at, last_error_at, last_error,
+                last_duration_ms, last_sent_count, consecutive_failures, updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(monitor_name) DO UPDATE SET
+                last_run_at=excluded.last_run_at,
+                last_success_at=CASE WHEN excluded.last_success_at IS NOT NULL THEN excluded.last_success_at ELSE monitor_runtime_status.last_success_at END,
+                last_error_at=CASE WHEN excluded.last_error_at IS NOT NULL THEN excluded.last_error_at ELSE monitor_runtime_status.last_error_at END,
+                last_error=CASE WHEN excluded.last_error != '' THEN excluded.last_error ELSE monitor_runtime_status.last_error END,
+                last_duration_ms=excluded.last_duration_ms,
+                last_sent_count=excluded.last_sent_count,
+                consecutive_failures=excluded.consecutive_failures,
+                updated_at=excluded.updated_at
+            """,
+            (
+                monitor_name,
+                now,
+                now if ok else None,
+                now if not ok else None,
+                "" if ok else error[:1000],
+                max(0, int(duration_ms)),
+                max(0, int(sent_count)),
+                failures,
+                now,
+            ),
+        )
+        conn.commit()
+
+
+def list_monitor_runtime_status() -> dict[str, dict[str, Any]]:
+    with closing(db()) as conn:
+        rows = conn.execute("SELECT * FROM monitor_runtime_status").fetchall()
+    output: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        output[str(row["monitor_name"])] = {
+            "last_run_at": row["last_run_at"],
+            "last_success_at": row["last_success_at"],
+            "last_error_at": row["last_error_at"],
+            "last_error": row["last_error"] or "",
+            "last_duration_ms": int(row["last_duration_ms"] or 0),
+            "last_sent_count": int(row["last_sent_count"] or 0),
+            "consecutive_failures": int(row["consecutive_failures"] or 0),
+        }
+    return output
+
+
+def get_monitor_status_badge(status: dict[str, Any] | None) -> str:
+    if not status:
+        return "未运行"
+    if int(status.get("consecutive_failures", 0)) > 0:
+        return f"异常 x{int(status.get('consecutive_failures', 0))}"
+    return "正常"
+
+
+def record_discovered_group_chat_data(chat_id: int, title: str, username: str = "") -> None:
+    with closing(db()) as conn:
+        conn.execute(
+            """
+            INSERT INTO discovered_group_chats(chat_id, title, username, last_seen_at, active)
+            VALUES(?,?,?,?,1)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                title=excluded.title,
+                username=excluded.username,
+                last_seen_at=excluded.last_seen_at,
+                active=1
+            """,
+            (int(chat_id), str(title or chat_id), str(username or ""), now_iso()),
+        )
+        conn.commit()
+
+
+def record_discovered_group_chat(message: Message) -> None:
+    if message.chat.type not in {"group", "supergroup"}:
+        return
+    chat_id = int(message.chat.id)
+    title = str(getattr(message.chat, "title", "") or str(chat_id))
+    username = str(getattr(message.chat, "username", "") or "")
+    record_discovered_group_chat_data(chat_id, title, username)
+
+
+def list_discovered_group_chats(limit: int = 200) -> list[dict[str, Any]]:
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT chat_id, title, username, last_seen_at, active FROM discovered_group_chats ORDER BY last_seen_at DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+    return [
+        {
+            "chat_id": int(row["chat_id"]),
+            "title": str(row["title"] or row["chat_id"]),
+            "username": str(row["username"] or ""),
+            "last_seen_at": str(row["last_seen_at"] or ""),
+            "active": bool(row["active"]),
+        }
+        for row in rows
+    ]
 
 
 def lookup_reply_target(admin_chat: int, admin_message_id: int) -> int | None:
@@ -747,6 +1390,12 @@ async def user_message(message: Message) -> None:
         logger.info("incoming message is admin plain message; ignored by user relay")
         return
     if message.chat.type != "private":
+        if message.chat.type in {"group", "supergroup"}:
+            try:
+                record_discovered_group_chat(message)
+                await handle_group_keyword_message(message, listen_source="bot")
+            except Exception:
+                logger.exception("group keyword handling failed chat_id=%s message_id=%s", message.chat.id, message.message_id)
         logger.info("incoming message ignored because chat_type is not private: %s", message.chat.type)
         return
     uid, full, username = user_display(message)
@@ -1037,8 +1686,10 @@ async def run_monitor(monitor: dict[str, Any]) -> int:
     name = monitor.get("name", "unnamed")
     mtype = monitor.get("type", "web")
     url = monitor.get("url")
+    started = time.time()
     if not url:
         logger.error("monitor %s missing url", name)
+        record_monitor_runtime(name, ok=False, duration_ms=int((time.time() - started) * 1000), sent_count=0, error="missing url")
         return 0
     keywords = monitor.get("keywords") or []
     timeout = int((config.get("http") or {}).get("timeout_seconds", 20))
@@ -1096,8 +1747,10 @@ async def run_monitor(monitor: dict[str, Any]) -> int:
                 continue
             if await admin_send_monitor(text, name):
                 sent_count += 1
-    except Exception:
+        record_monitor_runtime(name, ok=True, duration_ms=int((time.time() - started) * 1000), sent_count=sent_count)
+    except Exception as e:
         logger.exception("monitor failed: %s %s", name, url)
+        record_monitor_runtime(name, ok=False, duration_ms=int((time.time() - started) * 1000), sent_count=sent_count, error=str(e))
     return sent_count
 
 
@@ -1243,13 +1896,34 @@ def login_page(error: str = "") -> str:
 <title>登录 · tg-watchbot</title>
 <link rel=icon href="{app_icon_data_uri()}">
 <style>
-:root{{color-scheme:light;--canvas:#f0f0f0;--ink:#121212;--muted:#5c5c5c;--red:#d02020;--blue:#1040c0;--yellow:#f0c020;--white:#fff}}
-*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;font-family:Outfit,Aptos,'Segoe UI',sans-serif;background:var(--canvas);color:var(--ink);display:grid;place-items:center;padding:24px;overflow:hidden}}
-body:before{{content:"";position:fixed;inset:auto auto -90px -70px;width:220px;height:220px;border:4px solid var(--ink);border-radius:50%;background:var(--yellow);z-index:-1}}body:after{{content:"";position:fixed;top:54px;right:8vw;width:150px;height:150px;background:var(--blue);border:4px solid var(--ink);transform:rotate(12deg);z-index:-1}}
-.login-card{{position:relative;width:min(420px,100%);padding:32px;border:4px solid var(--ink);border-radius:0;background:var(--white);box-shadow:8px 8px 0 var(--ink)}}
+:root{{color-scheme:light;--canvas:#f0f0f0;--ink:#121212;--muted:#5c5c5c;--red:#d02020;--blue:#1040c0;--yellow:#f0c020;--white:#fff;--ease:cubic-bezier(.2,.8,.2,1)}}
+*{{box-sizing:border-box}}
+body{{margin:0;min-height:100vh;font-family:Outfit,Aptos,'Segoe UI',sans-serif;background:var(--canvas);color:var(--ink);display:grid;place-items:center;padding:24px;overflow:hidden}}
+body:before{{content:"";position:fixed;inset:auto auto -90px -70px;width:220px;height:220px;border:4px solid var(--ink);border-radius:50%;background:var(--yellow);z-index:-1;animation:floatA 5.5s var(--ease) infinite alternate}}
+body:after{{content:"";position:fixed;top:54px;right:8vw;width:150px;height:150px;background:var(--blue);border:4px solid var(--ink);transform:rotate(12deg);z-index:-1;animation:floatB 6.5s var(--ease) infinite alternate}}
+.login-card{{position:relative;width:min(420px,100%);padding:32px;border:4px solid var(--ink);border-radius:0;background:var(--white);box-shadow:8px 8px 0 var(--ink);contain:paint;will-change:transform;animation:cardIn .28s var(--ease)}}
 .login-card:after{{content:"";position:absolute;right:22px;top:22px;width:24px;height:24px;background:var(--red);clip-path:polygon(50% 0,0 100%,100% 100%)}}
-.logo{{width:58px;height:58px;border:4px solid var(--ink);background:var(--white);position:relative;margin-bottom:22px;box-shadow:4px 4px 0 var(--ink)}}.logo:before{{content:"";position:absolute;left:8px;top:8px;width:18px;height:18px;border:3px solid var(--ink);border-radius:50%;background:var(--red)}}.logo:after{{content:"";position:absolute;right:7px;top:8px;width:18px;height:18px;border:3px solid var(--ink);background:var(--blue)}}.logo i{{position:absolute;left:13px;bottom:7px;width:30px;height:22px;background:var(--yellow);border:3px solid var(--ink);clip-path:polygon(50% 0,0 100%,100% 100%)}}
-h1{{margin:0 0 8px;font-size:34px;line-height:.95;text-transform:uppercase;color:var(--ink);letter-spacing:0;font-weight:900}}p{{margin:0 0 24px;color:var(--muted);line-height:1.5;font-weight:500}}label{{display:block;margin:14px 0 7px;color:var(--ink);font-size:12px;font-weight:900;text-transform:uppercase;letter-spacing:.08em}}input{{width:100%;border:3px solid var(--ink);border-radius:0;background:#fff;color:var(--ink);padding:12px 13px;font-size:15px;outline:none}}input:focus{{box-shadow:4px 4px 0 var(--blue)}}button{{width:100%;margin-top:22px;border:3px solid var(--ink);border-radius:0;padding:12px 16px;background:var(--red);color:white;font-weight:900;font-size:14px;text-transform:uppercase;letter-spacing:.08em;cursor:pointer;box-shadow:4px 4px 0 var(--ink)}}button:active{{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--ink)}}.login-error{{background:#fff;border:3px solid var(--ink);color:var(--red);padding:10px 12px;margin-bottom:16px;font-weight:800;box-shadow:4px 4px 0 var(--red)}}.foot{{margin-top:18px;color:var(--muted);font-size:13px;text-align:center;font-weight:700}}
+.logo{{width:58px;height:58px;border:4px solid var(--ink);background:var(--white);position:relative;margin-bottom:22px;box-shadow:4px 4px 0 var(--ink);transition:transform .22s var(--ease);will-change:transform}}
+.logo:before{{content:"";position:absolute;left:8px;top:8px;width:18px;height:18px;border:3px solid var(--ink);border-radius:50%;background:var(--red)}}
+.logo:after{{content:"";position:absolute;right:7px;top:8px;width:18px;height:18px;border:3px solid var(--ink);background:var(--blue)}}
+.logo i{{position:absolute;left:13px;bottom:7px;width:30px;height:22px;background:var(--yellow);border:3px solid var(--ink);clip-path:polygon(50% 0,0 100%,100% 100%)}}
+.login-card:hover .logo{{transform:translateY(-1px)}}
+h1{{margin:0 0 8px;font-size:34px;line-height:.95;text-transform:uppercase;color:var(--ink);letter-spacing:0;font-weight:900}}
+p{{margin:0 0 24px;color:var(--muted);line-height:1.5;font-weight:500}}
+label{{display:block;margin:14px 0 7px;color:var(--ink);font-size:12px;font-weight:900;text-transform:uppercase;letter-spacing:.08em}}
+input{{width:100%;border:3px solid var(--ink);border-radius:0;background:#fff;color:var(--ink);padding:12px 13px;font-size:15px;outline:none;transition:transform .16s var(--ease),box-shadow .16s var(--ease);will-change:transform}}
+input:focus{{transform:translate(-1px,-1px);box-shadow:4px 4px 0 var(--blue)}}
+button{{width:100%;margin-top:22px;border:3px solid var(--ink);border-radius:0;padding:12px 16px;background:var(--red);color:white;font-weight:900;font-size:14px;text-transform:uppercase;letter-spacing:.08em;cursor:pointer;box-shadow:4px 4px 0 var(--ink);transition:transform .16s var(--ease),background-color .16s var(--ease);will-change:transform}}
+button:hover{{transform:translate(-1px,-1px);background:#bc1c1c}}
+button:active{{transform:translate(2px,2px)}}
+.login-error{{background:#fff;border:3px solid var(--ink);color:var(--red);padding:10px 12px;margin-bottom:16px;font-weight:800;box-shadow:4px 4px 0 var(--red)}}
+.foot{{margin-top:18px;color:var(--muted);font-size:13px;text-align:center;font-weight:700}}
+@keyframes cardIn{{from{{opacity:.0;transform:translateY(8px)}}to{{opacity:1;transform:none}}}}
+@keyframes floatA{{from{{transform:translateY(0)}}to{{transform:translateY(-8px)}}}}
+@keyframes floatB{{from{{transform:rotate(12deg) translateY(0)}}to{{transform:rotate(12deg) translateY(-9px)}}}}
+@media (prefers-reduced-motion: reduce){{
+  *,*::before,*::after{{animation:none!important;transition:none!important}}
+}}
 </style></head><body><main class=login-card><div class=logo><i></i></div><h1>tg-watchbot</h1><p>登录后管理 Telegram 机器人、关键词监控和提醒。</p>{err}<form method=post action=/login><label>用户名</label><input name=username autocomplete=username autofocus><label>密码</label><input name=password type=password autocomplete=current-password><button type=submit>登录面板</button></form><div class=foot>localhost panel</div></main></body></html>"""
 
 
@@ -1265,6 +1939,9 @@ def env_values() -> dict[str, str]:
         "WEB_PANEL_USER": os.getenv("WEB_PANEL_USER", "admin"),
         "WEB_PANEL_PASSWORD": os.getenv("WEB_PANEL_PASSWORD", "admin"),
         "WEB_PANEL_SESSION_SECRET": os.getenv("WEB_PANEL_SESSION_SECRET", ""),
+        "TG_API_ID": os.getenv("TG_API_ID", ""),
+        "TG_API_HASH": os.getenv("TG_API_HASH", ""),
+        "TG_API_SESSION": os.getenv("TG_API_SESSION", ""),
     }
 
 
@@ -1289,6 +1966,9 @@ def write_env_values(values: dict[str, str]) -> None:
         f"WEB_PANEL_USER={values.get('WEB_PANEL_USER','admin')}",
         f"WEB_PANEL_PASSWORD={values.get('WEB_PANEL_PASSWORD','admin')}",
         f"WEB_PANEL_SESSION_SECRET={session_value}",
+        f"TG_API_ID={values.get('TG_API_ID','')}",
+        f"TG_API_HASH={values.get('TG_API_HASH','')}",
+        f"TG_API_SESSION={values.get('TG_API_SESSION','')}",
         "",
     ]
     ENV_PATH.write_text("\n".join(lines), encoding="utf-8")
@@ -1311,6 +1991,44 @@ def cfg_save(new_cfg: dict[str, Any]) -> None:
             raise ValueError("每个 monitor 必须是对象")
         if int(m.get("interval_seconds", MIN_INTERVAL_SECONDS)) < MIN_INTERVAL_SECONDS:
             m["interval_seconds"] = MIN_INTERVAL_SECONDS
+    group_monitor_rows = new_cfg.get("group_monitors") or []
+    if group_monitor_rows is not None and not isinstance(group_monitor_rows, list):
+        raise ValueError("group_monitors 必须是列表")
+    for gm in group_monitor_rows:
+        if not isinstance(gm, dict):
+            raise ValueError("每个 group_monitor 必须是对象")
+        if "chat_id" in gm:
+            gm["chat_id"] = safe_int(gm["chat_id"], 0)
+        gm.setdefault("enabled", True)
+        gm.setdefault("keywords", [])
+        gm.setdefault("exclude_keywords", [])
+        gm.setdefault("notify_telegram", True)
+        listen_source = str(gm.get("listen_source") or "bot").strip().lower() or "bot"
+        if listen_source not in {"bot", "user_session"}:
+            listen_source = "bot"
+        gm["listen_source"] = listen_source
+        summary_mode = str(gm.get("summary_mode") or "template").strip().lower() or "template"
+        if summary_mode not in {"template", "ai"}:
+            summary_mode = "template"
+        gm["summary_mode"] = summary_mode
+        gm["ai_base_url"] = str(gm.get("ai_base_url") or "").strip()
+        gm["ai_api_key"] = str(gm.get("ai_api_key") or "").strip()
+        gm["ai_model"] = str(gm.get("ai_model") or "gpt-4o-mini").strip()
+        ai_interface = str(gm.get("ai_interface") or "responses").strip().lower() or "responses"
+        if ai_interface not in {"responses", "chat"}:
+            ai_interface = "responses"
+        gm["ai_interface"] = ai_interface
+        gm["ai_temperature"] = safe_float(gm.get("ai_temperature", 0.2), 0.2)
+        gm["ai_timeout_seconds"] = max(1, safe_int(gm.get("ai_timeout_seconds", 30), 30))
+        gm["ai_prompt"] = str(gm.get("ai_prompt") or "").strip()
+        gm["ai_min_interval_seconds"] = max(
+            0,
+            safe_int(gm.get("ai_min_interval_seconds", DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS), DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS),
+        )
+        gm["ai_dedupe_window_seconds"] = max(
+            0,
+            safe_int(gm.get("ai_dedupe_window_seconds", DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS), DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS),
+        )
     CONFIG_PATH.write_text(yaml.safe_dump(new_cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
     global config
     config = new_cfg
@@ -1327,6 +2045,82 @@ def reload_scheduler_jobs() -> None:
 
 def parse_lines(text: str) -> list[str]:
     return [x.strip() for x in (text or "").splitlines() if x.strip()]
+
+
+def safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def app_meta_get(key: str) -> str:
+    with closing(db()) as conn:
+        row = conn.execute("SELECT meta_value FROM app_meta WHERE meta_key=?", (key,)).fetchone()
+    return str(row["meta_value"]) if row and row["meta_value"] is not None else ""
+
+
+def app_meta_set(key: str, value: str) -> None:
+    with closing(db()) as conn:
+        conn.execute(
+            """
+            INSERT INTO app_meta(meta_key, meta_value, updated_at)
+            VALUES(?,?,?)
+            ON CONFLICT(meta_key) DO UPDATE SET
+                meta_value=excluded.meta_value,
+                updated_at=excluded.updated_at
+            """,
+            (key, value, now_iso()),
+        )
+        conn.commit()
+
+
+def git_run(repo_dir: Path, args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo_dir), *args],
+        capture_output=True,
+        text=True,
+        check=check,
+    )
+
+
+def current_git_branch(repo_dir: Path) -> str:
+    try:
+        return git_run(repo_dir, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip() or "main"
+    except Exception:
+        return "main"
+
+
+def git_update_status(repo_dir: Path, branch: str, fetch_remote: bool = True) -> dict[str, Any]:
+    if fetch_remote:
+        git_run(repo_dir, ["fetch", "origin", branch], check=True)
+    head = git_run(repo_dir, ["rev-parse", "HEAD"]).stdout.strip()
+    remote_ref = f"origin/{branch}"
+    remote_head = git_run(repo_dir, ["rev-parse", remote_ref]).stdout.strip()
+    counts = git_run(repo_dir, ["rev-list", "--left-right", "--count", f"HEAD...{remote_ref}"]).stdout.strip().split()
+    ahead = safe_int(counts[0] if len(counts) > 0 else 0, 0)
+    behind = safe_int(counts[1] if len(counts) > 1 else 0, 0)
+    dirty = bool(git_run(repo_dir, ["status", "--porcelain"], check=True).stdout.strip())
+    return {
+        "branch": branch,
+        "head": head,
+        "remote_head": remote_head,
+        "ahead": ahead,
+        "behind": behind,
+        "dirty": dirty,
+    }
+
+
+def rollback_to_commit(repo_dir: Path, commit: str) -> None:
+    git_run(repo_dir, ["cat-file", "-e", f"{commit}^{{commit}}"], check=True)
+    git_run(repo_dir, ["reset", "--hard", commit], check=True)
 
 
 def monitor_from_form(
@@ -1384,15 +2178,85 @@ def layout(title: str, body: str) -> str:
 <title>{html_escape(title)} · tg-watchbot</title>
 <link rel=icon href="{app_icon_data_uri()}">
 <style>
-:root{{--canvas:#f0f0f0;--ink:#121212;--muted:#5c5c5c;--red:#d02020;--blue:#1040c0;--yellow:#f0c020;--white:#fff;--gray:#e0e0e0}}
-*{{box-sizing:border-box}}body{{font-family:Outfit,Aptos,'Segoe UI',sans-serif;background:var(--canvas);color:var(--ink);margin:0;letter-spacing:0}}body:before{{content:"";position:fixed;right:-70px;top:110px;width:190px;height:190px;border:4px solid var(--ink);border-radius:50%;background:var(--yellow);z-index:-1}}body:after{{content:"";position:fixed;left:190px;bottom:-80px;width:190px;height:190px;border:4px solid var(--ink);background:var(--blue);transform:rotate(45deg);z-index:-1}}
-a{{color:var(--ink);text-decoration:none}}a:hover{{text-decoration:underline}}.shell{{display:grid;grid-template-columns:254px minmax(0,1fr);min-height:100vh}}aside{{border-right:4px solid var(--ink);background:var(--white);padding:18px 14px;position:sticky;top:0;height:100vh;overflow:auto}}main{{padding:24px 30px;min-width:0;max-width:1440px}}.brand{{display:flex;gap:10px;align-items:center;margin-bottom:18px;padding:0 4px 16px;border-bottom:4px solid var(--ink)}}.mark{{width:44px;height:44px;border:4px solid var(--ink);background:var(--white);position:relative;box-shadow:4px 4px 0 var(--ink);flex:0 0 auto}}.mark:before{{content:"";position:absolute;left:5px;top:5px;width:13px;height:13px;border:3px solid var(--ink);border-radius:50%;background:var(--red)}}.mark:after{{content:"";position:absolute;right:4px;top:5px;width:13px;height:13px;border:3px solid var(--ink);background:var(--blue)}}.mark i{{position:absolute;left:8px;bottom:4px;width:25px;height:18px;background:var(--yellow);border:3px solid var(--ink);clip-path:polygon(50% 0,0 100%,100% 100%)}}.brand b{{font-size:18px;color:var(--ink);font-weight:900;text-transform:uppercase}}.brand small{{display:block;color:var(--muted);margin-top:2px;font-weight:700}}nav{{display:grid;gap:13px}}nav section{{display:grid;gap:6px;padding:9px;border:3px solid var(--ink);background:#fff;box-shadow:3px 3px 0 var(--ink)}}nav section>b{{display:inline-block;width:max-content;margin:-20px 0 2px -2px;padding:3px 8px;border:3px solid var(--ink);background:var(--yellow);font-size:12px;font-weight:900;text-transform:uppercase}}nav a{{position:relative;padding:9px 10px;border:3px solid var(--ink);background:var(--white);color:var(--ink);font-weight:900;text-transform:uppercase;font-size:12px;box-shadow:2px 2px 0 var(--ink)}}nav section:nth-child(2)>b{{background:var(--blue);color:white}}nav section:nth-child(3)>b{{background:var(--red);color:white}}nav section:nth-child(4)>b{{background:var(--gray)}}nav a:hover{{text-decoration:none;transform:translate(-1px,-1px);box-shadow:4px 4px 0 var(--ink)}}.logout{{background:var(--red)!important;color:white}}.top{{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:20px;border-bottom:4px solid var(--ink);padding-bottom:14px}}.top h1{{margin:0;font-size:34px;line-height:.95;color:var(--ink);font-weight:900;text-transform:uppercase}}.top .badge{{background:var(--blue);color:white}}
-.btn{{background:var(--white);color:var(--ink);padding:7px 11px;border:3px solid var(--ink);border-radius:0;display:inline-block;cursor:pointer;font-weight:900;line-height:1.35;text-transform:uppercase;font-size:12px;box-shadow:3px 3px 0 var(--ink)}}.btn:hover{{text-decoration:none;transform:translate(-1px,-1px);box-shadow:5px 5px 0 var(--ink)}}.btn:active{{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--ink)}}.btn.primary{{background:var(--red);color:white}}.btn.danger{{background:var(--red);color:white}}.btn.ok{{background:var(--yellow);color:var(--ink)}}.actions{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}}
-.card{{position:relative;background:var(--white);border:4px solid var(--ink);border-radius:0;padding:18px;margin:16px 0;box-shadow:8px 8px 0 var(--ink)}}.card:after{{content:"";position:absolute;top:12px;right:12px;width:14px;height:14px;background:var(--red);border:3px solid var(--ink)}}.toolbar{{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;flex-wrap:wrap;padding-right:34px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}}.form-actions{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:18px 0 0}}h2,h3{{font-weight:900;text-transform:uppercase;letter-spacing:0}}h2{{font-size:24px}}h3{{font-size:16px;border-bottom:3px solid var(--ink);padding-bottom:6px;margin-top:20px}}
-input,select,textarea{{width:100%;box-sizing:border-box;background:#fff;color:var(--ink);border:3px solid var(--ink);border-radius:0;padding:10px 11px;outline:none;font-size:14px;font-weight:600}}input:focus,select:focus,textarea:focus{{box-shadow:4px 4px 0 var(--blue)}}textarea{{min-height:116px;font-family:'Cascadia Mono',Consolas,monospace}}label{{display:block;margin:10px 0 5px;color:var(--ink);font-weight:900;font-size:12px;text-transform:uppercase;letter-spacing:.06em}}.check-row{{display:flex;gap:10px;align-items:center;flex-wrap:wrap}}.check-row label{{display:flex;gap:7px;align-items:center;margin:0;padding:8px 10px;border:3px solid var(--ink);background:var(--gray)}}.check-row input{{width:auto}}
-small,.muted{{color:var(--muted);line-height:1.5;font-weight:600}}table{{width:100%;border-collapse:collapse;border:3px solid var(--ink);background:white}}td,th{{border:3px solid var(--ink);padding:10px;text-align:left;vertical-align:top}}th{{color:var(--ink);font-size:12px;background:var(--yellow);text-transform:uppercase;letter-spacing:.06em}}tr:nth-child(even) td{{background:#fafafa}}.badge{{padding:4px 8px;border:3px solid var(--ink);border-radius:999px;background:var(--blue);color:white;font-size:12px;font-weight:900;text-transform:uppercase}}.msg{{padding:11px 12px;border:3px solid var(--ink);background:var(--yellow);color:var(--ink);margin:10px 0;font-weight:900;box-shadow:4px 4px 0 var(--ink)}}pre{{white-space:pre-wrap;background:#121212;color:#fff;padding:13px;border:4px solid var(--ink);max-height:420px;overflow:auto;box-shadow:5px 5px 0 var(--yellow)}}
-@media(max-width:860px){{.shell{{grid-template-columns:1fr}}aside{{position:relative;height:auto}}main{{padding:18px}}nav{{grid-template-columns:repeat(2,minmax(0,1fr))}}.top{{align-items:flex-start;flex-direction:column}}.card{{box-shadow:5px 5px 0 var(--ink)}}}}
-</style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><section><b>消息</b><a href='/inbox'>收件箱</a><a href='/users'>用户管理</a><a href='/send'>主动发消息</a><a href='/replies'>快捷回复</a><a href='/rules'>私聊广告拦截</a></section><section><b>监控</b><a href='/'>监控面板</a><a href='/monitor/new'>新增监控</a><a href='/monitor/events'>推送历史</a><a href='/run-once'>手动检查</a></section><section><b>配置</b><a href='/settings'>Bot / 面板设置</a><a href='/yaml'>YAML 高级编辑</a><a href='/config/export'>导出配置</a></section><section><b>系统</b><a href='/logs'>运行日志</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启机器人</a><a class=logout href='/logout'>退出登录</a></section></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><span class=badge>WatchBot Panel</span></div>
+:root{{--canvas:#f0f0f0;--ink:#121212;--muted:#5c5c5c;--red:#d02020;--blue:#1040c0;--yellow:#f0c020;--white:#fff;--gray:#e0e0e0;--ease:cubic-bezier(.2,.8,.2,1)}}
+*{{box-sizing:border-box}}
+body{{font-family:Outfit,Aptos,'Segoe UI',sans-serif;background:var(--canvas);color:var(--ink);margin:0;letter-spacing:0;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}}
+body:before{{content:"";position:fixed;right:-70px;top:110px;width:190px;height:190px;border:4px solid var(--ink);border-radius:50%;background:var(--yellow);z-index:-1;animation:floatA 7s var(--ease) infinite alternate}}
+body:after{{content:"";position:fixed;left:190px;bottom:-80px;width:190px;height:190px;border:4px solid var(--ink);background:var(--blue);transform:rotate(45deg);z-index:-1;animation:floatB 8s var(--ease) infinite alternate}}
+a{{color:var(--ink);text-decoration:none}}
+a:hover{{text-decoration:underline}}
+.shell{{display:grid;grid-template-columns:254px minmax(0,1fr);min-height:100vh}}
+aside{{border-right:4px solid var(--ink);background:var(--white);padding:18px 14px;position:sticky;top:0;height:100vh;overflow:auto;overscroll-behavior:contain}}
+main{{padding:24px 30px;min-width:0;max-width:1440px;animation:mainIn .25s var(--ease)}}
+.brand{{display:flex;gap:10px;align-items:center;margin-bottom:18px;padding:0 4px 16px;border-bottom:4px solid var(--ink)}}
+.mark{{width:44px;height:44px;border:4px solid var(--ink);background:var(--white);position:relative;box-shadow:4px 4px 0 var(--ink);flex:0 0 auto;transition:transform .2s var(--ease);will-change:transform}}
+.mark:before{{content:"";position:absolute;left:5px;top:5px;width:13px;height:13px;border:3px solid var(--ink);border-radius:50%;background:var(--red)}}
+.mark:after{{content:"";position:absolute;right:4px;top:5px;width:13px;height:13px;border:3px solid var(--ink);background:var(--blue)}}
+.mark i{{position:absolute;left:8px;bottom:4px;width:25px;height:18px;background:var(--yellow);border:3px solid var(--ink);clip-path:polygon(50% 0,0 100%,100% 100%)}}
+.brand:hover .mark{{transform:translateY(-1px)}}
+.brand b{{font-size:18px;color:var(--ink);font-weight:900;text-transform:uppercase}}
+.brand small{{display:block;color:var(--muted);margin-top:2px;font-weight:700}}
+nav{{display:grid;gap:13px}}
+nav section{{display:grid;gap:6px;padding:9px;border:3px solid var(--ink);background:#fff;box-shadow:3px 3px 0 var(--ink);transition:transform .18s var(--ease);contain:paint}}
+nav section:hover{{transform:translateY(-1px)}}
+nav section>b{{display:inline-block;width:max-content;margin:-20px 0 2px -2px;padding:3px 8px;border:3px solid var(--ink);background:var(--yellow);font-size:12px;font-weight:900;text-transform:uppercase}}
+nav a{{position:relative;padding:9px 10px;border:3px solid var(--ink);background:var(--white);color:var(--ink);font-weight:900;text-transform:uppercase;font-size:12px;box-shadow:2px 2px 0 var(--ink);transition:transform .14s var(--ease),box-shadow .14s var(--ease),background-color .14s var(--ease);will-change:transform}}
+nav section:nth-child(2)>b{{background:var(--blue);color:white}}
+nav section:nth-child(3)>b{{background:var(--red);color:white}}
+nav section:nth-child(4)>b{{background:var(--gray)}}
+nav a:hover{{text-decoration:none;transform:translate(-1px,-1px);box-shadow:4px 4px 0 var(--ink)}}
+nav a:active{{transform:translate(1px,1px);box-shadow:1px 1px 0 var(--ink)}}
+.logout{{background:var(--red)!important;color:white}}
+.top{{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:20px;border-bottom:4px solid var(--ink);padding-bottom:14px}}
+.top h1{{margin:0;font-size:34px;line-height:.95;color:var(--ink);font-weight:900;text-transform:uppercase}}
+.top .badge{{background:var(--blue);color:white}}
+.btn{{background:var(--white);color:var(--ink);padding:7px 11px;border:3px solid var(--ink);border-radius:0;display:inline-block;cursor:pointer;font-weight:900;line-height:1.35;text-transform:uppercase;font-size:12px;box-shadow:3px 3px 0 var(--ink);transition:transform .14s var(--ease),box-shadow .14s var(--ease),background-color .14s var(--ease);will-change:transform}}
+.btn:hover{{text-decoration:none;transform:translate(-1px,-1px);box-shadow:5px 5px 0 var(--ink)}}
+.btn:active{{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--ink)}}
+.btn.primary{{background:var(--red);color:white}}
+.btn.danger{{background:var(--red);color:white}}
+.btn.ok{{background:var(--yellow);color:var(--ink)}}
+.actions{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}}
+.card{{position:relative;background:var(--white);border:4px solid var(--ink);border-radius:0;padding:18px;margin:16px 0;box-shadow:8px 8px 0 var(--ink);transition:transform .2s var(--ease);contain:paint}}
+.card:hover{{transform:translateY(-1px)}}
+.card:after{{content:"";position:absolute;top:12px;right:12px;width:14px;height:14px;background:var(--red);border:3px solid var(--ink)}}
+.toolbar{{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;flex-wrap:wrap;padding-right:34px}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}}
+.form-actions{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:18px 0 0}}
+h2,h3{{font-weight:900;text-transform:uppercase;letter-spacing:0}}
+h2{{font-size:24px}}
+h3{{font-size:16px;border-bottom:3px solid var(--ink);padding-bottom:6px;margin-top:20px}}
+input,select,textarea{{width:100%;box-sizing:border-box;background:#fff;color:var(--ink);border:3px solid var(--ink);border-radius:0;padding:10px 11px;outline:none;font-size:14px;font-weight:600;transition:transform .14s var(--ease),box-shadow .14s var(--ease);will-change:transform}}
+input:focus,select:focus,textarea:focus{{transform:translate(-1px,-1px);box-shadow:4px 4px 0 var(--blue)}}
+textarea{{min-height:116px;font-family:'Cascadia Mono',Consolas,monospace}}
+label{{display:block;margin:10px 0 5px;color:var(--ink);font-weight:900;font-size:12px;text-transform:uppercase;letter-spacing:.06em}}
+.check-row{{display:flex;gap:10px;align-items:center;flex-wrap:wrap}}
+.check-row label{{display:flex;gap:7px;align-items:center;margin:0;padding:8px 10px;border:3px solid var(--ink);background:var(--gray);transition:transform .14s var(--ease)}}
+.check-row label:hover{{transform:translateY(-1px)}}
+.check-row input{{width:auto}}
+small,.muted{{color:var(--muted);line-height:1.5;font-weight:600}}
+table{{width:100%;border-collapse:collapse;border:3px solid var(--ink);background:white}}
+td,th{{border:3px solid var(--ink);padding:10px;text-align:left;vertical-align:top}}
+th{{color:var(--ink);font-size:12px;background:var(--yellow);text-transform:uppercase;letter-spacing:.06em}}
+tr:nth-child(even) td{{background:#fafafa}}
+.badge{{padding:4px 8px;border:3px solid var(--ink);border-radius:999px;background:var(--blue);color:white;font-size:12px;font-weight:900;text-transform:uppercase}}
+.msg{{padding:11px 12px;border:3px solid var(--ink);background:var(--yellow);color:var(--ink);margin:10px 0;font-weight:900;box-shadow:4px 4px 0 var(--ink)}}
+pre{{white-space:pre-wrap;background:#121212;color:#fff;padding:13px;border:4px solid var(--ink);max-height:420px;overflow:auto;box-shadow:5px 5px 0 var(--yellow)}}
+@keyframes mainIn{{from{{opacity:.0;transform:translateY(8px)}}to{{opacity:1;transform:none}}}}
+@keyframes floatA{{from{{transform:translateY(0)}}to{{transform:translateY(-8px)}}}}
+@keyframes floatB{{from{{transform:rotate(45deg) translateY(0)}}to{{transform:rotate(45deg) translateY(-10px)}}}}
+@media(max-width:860px){{
+  .shell{{grid-template-columns:1fr}}
+  aside{{position:relative;height:auto}}
+  main{{padding:18px}}
+  nav{{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  .top{{align-items:flex-start;flex-direction:column}}
+  .card{{box-shadow:5px 5px 0 var(--ink)}}
+}}
+@media (prefers-reduced-motion: reduce){{
+  *,*::before,*::after{{animation:none!important;transition:none!important}}
+}}
+</style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><section><b>消息</b><a href='/inbox'>收件箱</a><a href='/users'>用户管理</a><a href='/send'>主动发消息</a><a href='/replies'>快捷回复</a><a href='/rules'>私聊广告拦截</a></section><section><b>监控</b><a href='/'>监控面板</a><a href='/monitor/new'>新增监控</a><a href='/group-monitors'>TG 群监听</a><a href='/monitor/events'>推送历史</a><a href='/run-once'>手动检查</a></section><section><b>配置</b><a href='/settings'>Bot / 面板设置</a><a href='/yaml'>YAML 高级编辑</a><a href='/config/export'>导出配置</a></section><section><b>系统</b><a href='/update'>更新代码</a><a href='/logs'>运行日志</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启机器人</a><a class=logout href='/logout'>退出登录</a></section></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><span class=badge>WatchBot Panel</span></div>
 {body}</main></div></body></html>"""
 
 
@@ -1424,6 +2288,46 @@ def monitor_form_html(m: dict[str, Any] | None = None, idx: int | None = None) -
 <label><input type=checkbox name=stock_change {checked('stock_change')}> 库存变化</label>
 <label><input type=checkbox name=notify_telegram {'checked' if m.get('notify_telegram', True) else ''}> 推送 Telegram</label></div>
 <div class=form-actions><button class='btn primary' type=submit>保存</button> <a class=btn href='/'>取消</a></div></form>"""
+
+
+def group_monitor_form_html(m: dict[str, Any] | None = None, idx: int | None = None) -> str:
+    m = m or {
+        "enabled": True,
+        "keywords": [],
+        "exclude_keywords": [],
+        "notify_telegram": True,
+        "summary_mode": "template",
+        "ai_base_url": "",
+        "ai_api_key": "",
+        "ai_model": "gpt-4o-mini",
+        "ai_interface": "responses",
+        "ai_temperature": 0.2,
+        "ai_timeout_seconds": 30,
+        "ai_prompt": "",
+        "ai_min_interval_seconds": DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS,
+        "ai_dedupe_window_seconds": DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS,
+        "listen_source": "bot",
+    }
+    action = "/group-monitors/save" if idx is not None else "/group-monitors/create"
+    hidden = f"<input type=hidden name=original_index value='{idx}'>" if idx is not None else ""
+    keywords = "\n".join(m.get("keywords") or [])
+    exclude_keywords = "\n".join(m.get("exclude_keywords") or [])
+    return f"""<form method=post action='{action}' class=card>{hidden}
+<div class=check-row><label><input type=checkbox name=enabled {'checked' if m.get('enabled', True) else ''}> 启用监听</label>
+<label><input type=checkbox name=notify_telegram {'checked' if m.get('notify_telegram', True) else ''}> 推送管理员</label></div>
+<div class=grid><div><label>监听名称</label><input name=name value='{html_escape(m.get('name',''))}' placeholder='例如：业务群关键词'></div>
+<div><label>群 chat_id</label><input name=chat_id value='{html_escape(m.get('chat_id',''))}' placeholder='例如 -1001234567890' required></div></div>
+<div class=grid><div><label>监听来源</label><select name=listen_source><option value=bot {'selected' if str(m.get('listen_source', 'bot')) == 'bot' else ''}>Bot</option><option value=user_session {'selected' if str(m.get('listen_source')) == 'user_session' else ''}>用户会话</option></select></div><div><label>来源说明</label><input value='Bot 需要被拉进群；用户会话适合 Bot 拉不进去的群' readonly></div></div>
+<div class=grid><div><label>总结模式</label><select name=summary_mode><option value=template {'selected' if str(m.get('summary_mode', 'template')) == 'template' else ''}>模板</option><option value=ai {'selected' if str(m.get('summary_mode')) == 'ai' else ''}>AI</option></select></div><div><label>AI 接口</label><select name=ai_interface><option value=responses {'selected' if str(m.get('ai_interface', 'responses')) == 'responses' else ''}>Responses</option><option value=chat {'selected' if str(m.get('ai_interface')) == 'chat' else ''}>Chat Completions</option></select></div></div>
+<div class=grid><div><label>AI Base URL</label><input name=ai_base_url value='{html_escape(m.get('ai_base_url',''))}' placeholder='https://api.example.com/v1'></div><div><label>AI Model</label><input name=ai_model value='{html_escape(m.get('ai_model','gpt-4o-mini'))}' placeholder='gpt-4o-mini'></div></div>
+<div class=grid><div><label>AI API Key</label><input name=ai_api_key value='{html_escape(m.get('ai_api_key',''))}' placeholder='sk-...'></div><div><label>AI Temperature</label><input name=ai_temperature type=number step=0.1 min=0 max=2 value='{html_escape(m.get('ai_temperature',0.2))}'></div></div>
+<p class=muted style='margin:0'>监听来源选“用户会话”时，需要在“Bot / 面板设置”填写 TG_API_ID、TG_API_HASH、TG_API_SESSION，并重启。</p>
+<div class=grid><div><label>AI 超时（秒）</label><input name=ai_timeout_seconds type=number min=1 value='{html_escape(m.get('ai_timeout_seconds',30))}'></div><div><label>最小推送间隔（秒）</label><input name=ai_min_interval_seconds type=number min=0 value='{html_escape(m.get('ai_min_interval_seconds',DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS))}'></div></div>
+<div class=grid><div><label>摘要去重窗口（秒）</label><input name=ai_dedupe_window_seconds type=number min=0 value='{html_escape(m.get('ai_dedupe_window_seconds',DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS))}'></div><div></div></div>
+<label>AI 总结提示词（可选）</label><textarea name=ai_prompt placeholder='留空则使用默认总结提示词'>{html_escape(m.get('ai_prompt',''))}</textarea>
+<label>关键词（一行一个）</label><textarea name=keywords>{html_escape(keywords)}</textarea>
+<label>排除词（一行一个）</label><textarea name=exclude_keywords>{html_escape(exclude_keywords)}</textarea>
+<div class=form-actions><button class='btn primary' type=submit>保存</button> <a class=btn href='/group-monitors'>返回列表</a></div></form>"""
 
 
 def create_panel_app() -> FastAPI:
@@ -1461,16 +2365,275 @@ def create_panel_app() -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     async def index(_: str = Depends(panel_auth)) -> str:
         cfg = cfg_load_fresh()
+        statuses = list_monitor_runtime_status()
         rows = []
         for i, m in enumerate(cfg.get("monitors") or []):
             tg = "TG" if m.get("notify_telegram", True) else "仅 Web"
-            rows.append(f"""<tr><td><span class=badge>{html_escape(m.get('type','web'))}</span></td><td><b>{html_escape(m.get('name',''))}</b><br><small>{html_escape(m.get('url',''))}</small></td><td>{html_escape(m.get('interval_seconds',60))}s<br><small>{tg}</small></td><td>{html_escape(', '.join(m.get('keywords') or []))}</td><td><a class=btn href='/monitor/{i}/edit'>编辑</a> <a class='btn ok' href='/monitor/{i}/preview'>预览</a> <a class='btn ok' href='/monitor/{i}/run'>检查</a> <a class='btn danger' href='/monitor/{i}/delete' onclick='return confirm("确定删除？")'>删除</a></td></tr>""")
-        body = f"""<div class=card><div class=toolbar><div><h2 style='margin:0 0 6px'>监控目标</h2><p class=muted style='margin:0'>当前 {len(cfg.get('monitors') or [])} 个；保存后自动重载定时任务。</p></div><div class=actions><a class='btn' href='/monitor/templates'>论坛模板</a> <a class='btn primary' href='/monitor/new'>新增监控</a> <a class='btn ok' href='/monitor/bulk'>批量新增</a></div></div><table style='margin-top:16px'><tr><th>类型</th><th>目标</th><th>间隔/通知</th><th>关键词</th><th>操作</th></tr>""" + "".join(rows) + "</table></div>"
+            name = str(m.get("name", ""))
+            st = statuses.get(name)
+            st_badge = get_monitor_status_badge(st)
+            st_line = "-"
+            if st:
+                st_line = (
+                    f"{html_escape(st_badge)} · 推送 {st.get('last_sent_count', 0)} · "
+                    f"{st.get('last_duration_ms', 0)}ms<br><small>成功: {html_escape(st.get('last_success_at') or '-')} / 失败: {html_escape(st.get('last_error_at') or '-')}</small>"
+                )
+                if st.get("last_error"):
+                    st_line += f"<br><small>{html_escape(str(st.get('last_error'))[:100])}</small>"
+            rows.append(f"""<tr><td><span class=badge>{html_escape(m.get('type','web'))}</span></td><td><b>{html_escape(name)}</b><br><small>{html_escape(m.get('url',''))}</small></td><td>{html_escape(m.get('interval_seconds',60))}s<br><small>{tg}</small></td><td>{html_escape(', '.join(m.get('keywords') or []))}</td><td>{st_line}</td><td><a class=btn href='/monitor/{i}/edit'>编辑</a> <a class='btn ok' href='/monitor/{i}/preview'>预览</a> <a class='btn ok' href='/monitor/{i}/run'>检查</a> <a class='btn danger' href='/monitor/{i}/delete' onclick='return confirm("确定删除？")'>删除</a></td></tr>""")
+        body = f"""<div class=card><div class=toolbar><div><h2 style='margin:0 0 6px'>监控目标</h2><p class=muted style='margin:0'>当前 {len(cfg.get('monitors') or [])} 个；保存后自动重载定时任务。</p></div><div class=actions><a class='btn' href='/monitor/templates'>论坛模板</a> <a class='btn primary' href='/monitor/new'>新增监控</a> <a class='btn ok' href='/monitor/bulk'>批量新增</a></div></div><table style='margin-top:16px'><tr><th>类型</th><th>目标</th><th>间隔/通知</th><th>关键词</th><th>运行状态</th><th>操作</th></tr>""" + "".join(rows) + "</table></div>"
         return layout("监控", body)
 
     @app.get("/monitor/new", response_class=HTMLResponse)
     async def new_monitor(_: str = Depends(panel_auth)) -> str:
         return layout("新增监控", "<div class=card><p class=muted>这里是新增单个监控。要一次加多个网站，用左侧/首页的「批量新增」。</p></div>" + monitor_form_html())
+
+    @app.get("/group-monitors", response_class=HTMLResponse)
+    async def group_monitors_page(_: str = Depends(panel_auth)) -> str:
+        cfg = cfg_load_fresh()
+        rows = cfg.get("group_monitors") or []
+        discovered = list_discovered_group_chats()
+        trs = []
+        for i, gm in enumerate(rows):
+            if not isinstance(gm, dict):
+                continue
+            enabled = "启用" if gm.get("enabled", True) else "关闭"
+            notify = "推送 TG" if gm.get("notify_telegram", True) else "仅记录"
+            source = "Bot" if str(gm.get("listen_source") or "bot") == "bot" else "用户会话"
+            kws = ", ".join([str(x) for x in (gm.get("keywords") or [])]) or "-"
+            exs = ", ".join([str(x) for x in (gm.get("exclude_keywords") or [])]) or "-"
+            trs.append(
+                f"""<tr><td>{i+1}</td><td><b>{html_escape(gm.get('name') or gm.get('chat_id') or '-')}</b><br><small>{html_escape(gm.get('chat_id') or '-')}</small></td><td>{enabled}<br><small>{notify} · {source}</small></td><td>{html_escape(kws)}</td><td>{html_escape(exs)}</td><td><a class=btn href='/group-monitors/{i}/edit'>编辑</a> <a class='btn danger' href='/group-monitors/{i}/delete' onclick='return confirm("确定删除？")'>删除</a></td></tr>"""
+            )
+        discovered_rows = []
+        for row in discovered:
+            title = row["title"]
+            chat_id = row["chat_id"]
+            username = f"@{row['username']}" if row["username"] else "-"
+            create_link = f"/group-monitors/new?chat_id={chat_id}&name={quote_plus(title)}"
+            discovered_rows.append(
+                f"""<tr><td><b>{html_escape(title)}</b><br><small>{html_escape(username)}</small></td><td><code>{chat_id}</code></td><td>{html_escape(row['last_seen_at'])}</td><td><a class='btn ok' href='{create_link}'>用此群创建监听</a></td></tr>"""
+            )
+        use_user_session = any(
+            isinstance(gm, dict) and str(gm.get("listen_source") or "bot") == "user_session"
+            for gm in rows
+        )
+        user_session_notice = ""
+        if use_user_session:
+            if TelegramClient is None:
+                user_session_notice = "<div class=msg>检测到“用户会话”监听，但未安装 telethon；该来源不会生效。</div>"
+            elif not user_session_ready():
+                user_session_notice = "<div class=msg>检测到“用户会话”监听，但 TG_API_ID / TG_API_HASH / TG_API_SESSION 未完整填写；该来源不会生效。</div>"
+        body = (
+            "<div class=card><div class=toolbar><div><h2 style='margin:0 0 6px'>TG 群关键词监听</h2>"
+            "<p class=muted style='margin:0'>监听选定群并在命中关键词时给管理员发送摘要。"
+            "需要在 @BotFather 关闭 /setprivacy 才能接收群普通消息。</p></div>"
+            "<div class=actions><a class='btn primary' href='/group-monitors/new'>新增监听</a></div></div>"
+            + user_session_notice
+            +
+            "<table style='margin-top:16px'><tr><th>#</th><th>监听</th><th>状态</th><th>关键词</th><th>排除词</th><th>操作</th></tr>"
+            + "".join(trs) + "</table></div>"
+            + "<div class=card><h2>已发现群聊</h2><p class=muted>Bot 在群里收到消息后会自动记录群信息。可直接选择群聊创建监听。</p>"
+            + "<table><tr><th>群聊</th><th>chat_id</th><th>最近活跃</th><th>操作</th></tr>"
+            + ("".join(discovered_rows) if discovered_rows else "<tr><td colspan='4'>暂无已发现群聊。先把 Bot 拉进群并发送一条消息。</td></tr>")
+            + "</table></div>"
+        )
+        return layout("TG 群监听", body)
+
+    @app.get("/group-monitors/new", response_class=HTMLResponse)
+    async def group_monitor_new(
+        _: str = Depends(panel_auth),
+        chat_id: str = "",
+        name: str = "",
+    ) -> str:
+        preset = None
+        if chat_id.strip() or name.strip():
+            preset = {
+                "enabled": True,
+                "chat_id": chat_id.strip(),
+                "name": name.strip(),
+                "keywords": [],
+                "exclude_keywords": [],
+                "notify_telegram": True,
+                "summary_mode": "template",
+                "ai_base_url": "",
+                "ai_api_key": "",
+                "ai_model": "gpt-4o-mini",
+                "ai_interface": "responses",
+                "ai_temperature": 0.2,
+                "ai_timeout_seconds": 30,
+                "ai_prompt": "",
+                "ai_min_interval_seconds": DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS,
+                "ai_dedupe_window_seconds": DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS,
+            }
+        return layout("新增 TG 群监听", group_monitor_form_html(preset))
+
+    @app.get("/group-monitors/{idx}/edit", response_class=HTMLResponse)
+    async def group_monitor_edit(idx: int, _: str = Depends(panel_auth)) -> str:
+        cfg = cfg_load_fresh()
+        rows = cfg.get("group_monitors") or []
+        if idx < 0 or idx >= len(rows) or not isinstance(rows[idx], dict):
+            raise HTTPException(404, "group monitor not found")
+        return layout("编辑 TG 群监听", group_monitor_form_html(rows[idx], idx))
+
+    async def save_group_monitor_common(
+        original_index: int | None,
+        name: str,
+        chat_id: str,
+        keywords: str,
+        exclude_keywords: str,
+        enabled: str | None,
+        notify_telegram: str | None,
+        listen_source: str,
+        summary_mode: str,
+        ai_base_url: str,
+        ai_api_key: str,
+        ai_model: str,
+        ai_interface: str,
+        ai_temperature: str,
+        ai_timeout_seconds: str,
+        ai_prompt: str,
+        ai_min_interval_seconds: str,
+        ai_dedupe_window_seconds: str,
+    ) -> RedirectResponse | HTMLResponse:
+        cfg = cfg_load_fresh()
+        rows = cfg.setdefault("group_monitors", [])
+        if not isinstance(rows, list):
+            rows = []
+            cfg["group_monitors"] = rows
+        try:
+            parsed_summary_mode = (summary_mode or "template").strip().lower() or "template"
+            if parsed_summary_mode not in {"template", "ai"}:
+                parsed_summary_mode = "template"
+            parsed_listen_source = (listen_source or "bot").strip().lower() or "bot"
+            if parsed_listen_source not in {"bot", "user_session"}:
+                parsed_listen_source = "bot"
+            parsed_ai_interface = (ai_interface or "responses").strip().lower() or "responses"
+            if parsed_ai_interface not in {"responses", "chat"}:
+                parsed_ai_interface = "responses"
+            item = {
+                "name": name.strip() or chat_id.strip(),
+                "enabled": bool(enabled),
+                "chat_id": int(chat_id.strip()),
+                "keywords": parse_lines(keywords),
+                "exclude_keywords": parse_lines(exclude_keywords),
+                "notify_telegram": bool(notify_telegram),
+                "listen_source": parsed_listen_source,
+                "summary_mode": parsed_summary_mode,
+                "ai_base_url": ai_base_url.strip(),
+                "ai_api_key": ai_api_key.strip(),
+                "ai_model": ai_model.strip() or "gpt-4o-mini",
+                "ai_interface": parsed_ai_interface,
+                "ai_temperature": safe_float(ai_temperature, 0.2),
+                "ai_timeout_seconds": max(1, safe_int(ai_timeout_seconds, 30)),
+                "ai_prompt": ai_prompt.strip(),
+                "ai_min_interval_seconds": max(0, safe_int(ai_min_interval_seconds, DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS)),
+                "ai_dedupe_window_seconds": max(0, safe_int(ai_dedupe_window_seconds, DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS)),
+            }
+        except Exception as e:
+            return HTMLResponse(layout("保存失败", f"<div class=card><pre>{html_escape(e)}</pre></div><p><a class=btn href='/group-monitors'>返回</a></p>"), status_code=400)
+        if original_index is None:
+            rows.append(item)
+        else:
+            if original_index < 0 or original_index >= len(rows):
+                raise HTTPException(404, "group monitor not found")
+            rows[original_index] = item
+        cfg_save(cfg)
+        return RedirectResponse("/group-monitors", status_code=303)
+
+    @app.post("/group-monitors/create")
+    async def group_monitor_create(
+        _: str = Depends(panel_auth),
+        name: str = Form(""),
+        chat_id: str = Form(""),
+        keywords: str = Form(""),
+        exclude_keywords: str = Form(""),
+        enabled: str | None = Form(None),
+        notify_telegram: str | None = Form(None),
+        summary_mode: str = Form("template"),
+        listen_source: str = Form("bot"),
+        ai_base_url: str = Form(""),
+        ai_api_key: str = Form(""),
+        ai_model: str = Form("gpt-4o-mini"),
+        ai_interface: str = Form("responses"),
+        ai_temperature: str = Form("0.2"),
+        ai_timeout_seconds: str = Form("30"),
+        ai_prompt: str = Form(""),
+        ai_min_interval_seconds: str = Form(str(DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS)),
+        ai_dedupe_window_seconds: str = Form(str(DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS)),
+    ) -> RedirectResponse | HTMLResponse:
+        return await save_group_monitor_common(
+            None,
+            name,
+            chat_id,
+            keywords,
+            exclude_keywords,
+            enabled,
+            notify_telegram,
+            listen_source,
+            summary_mode,
+            ai_base_url,
+            ai_api_key,
+            ai_model,
+            ai_interface,
+            ai_temperature,
+            ai_timeout_seconds,
+            ai_prompt,
+            ai_min_interval_seconds,
+            ai_dedupe_window_seconds,
+        )
+
+    @app.post("/group-monitors/save")
+    async def group_monitor_save(
+        _: str = Depends(panel_auth),
+        original_index: int = Form(...),
+        name: str = Form(""),
+        chat_id: str = Form(""),
+        keywords: str = Form(""),
+        exclude_keywords: str = Form(""),
+        enabled: str | None = Form(None),
+        notify_telegram: str | None = Form(None),
+        summary_mode: str = Form("template"),
+        listen_source: str = Form("bot"),
+        ai_base_url: str = Form(""),
+        ai_api_key: str = Form(""),
+        ai_model: str = Form("gpt-4o-mini"),
+        ai_interface: str = Form("responses"),
+        ai_temperature: str = Form("0.2"),
+        ai_timeout_seconds: str = Form("30"),
+        ai_prompt: str = Form(""),
+        ai_min_interval_seconds: str = Form(str(DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS)),
+        ai_dedupe_window_seconds: str = Form(str(DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS)),
+    ) -> RedirectResponse | HTMLResponse:
+        return await save_group_monitor_common(
+            original_index,
+            name,
+            chat_id,
+            keywords,
+            exclude_keywords,
+            enabled,
+            notify_telegram,
+            listen_source,
+            summary_mode,
+            ai_base_url,
+            ai_api_key,
+            ai_model,
+            ai_interface,
+            ai_temperature,
+            ai_timeout_seconds,
+            ai_prompt,
+            ai_min_interval_seconds,
+            ai_dedupe_window_seconds,
+        )
+
+    @app.get("/group-monitors/{idx}/delete")
+    async def group_monitor_delete(idx: int, _: str = Depends(panel_auth)) -> RedirectResponse:
+        cfg = cfg_load_fresh()
+        rows = cfg.get("group_monitors") or []
+        if 0 <= idx < len(rows):
+            rows.pop(idx)
+            cfg_save(cfg)
+        return RedirectResponse("/group-monitors", status_code=303)
 
     @app.get("/monitor/templates", response_class=HTMLResponse)
     async def monitor_templates(_: str = Depends(panel_auth)) -> str:
@@ -1641,6 +2804,9 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         body = f"""<h2>Bot / 面板设置</h2>{status}<div class=card><form method=post>
 <label>Telegram Bot Token</label><input name=TELEGRAM_BOT_TOKEN value='{html_escape(v['TELEGRAM_BOT_TOKEN'])}' placeholder='123456:ABC...'>
 <label>管理员 ADMIN_CHAT_ID（最多 3 个，用逗号分隔）</label><input name=ADMIN_CHAT_ID value='{html_escape(v['ADMIN_CHAT_ID'])}'>
+<h3>TG 用户会话（可选）</h3><p class=muted>仅用于“TG 群监听 -> 监听来源=用户会话”，适合 Bot 无法加入的群。填写后需重启。</p>
+<div class=grid><div><label>TG_API_ID</label><input name=TG_API_ID value='{html_escape(v['TG_API_ID'])}' placeholder='例如 12345678'></div><div><label>TG_API_HASH</label><input name=TG_API_HASH value='{html_escape(v['TG_API_HASH'])}' placeholder='32位哈希'></div></div>
+<label>TG_API_SESSION</label><textarea name=TG_API_SESSION placeholder='Telethon StringSession'>{html_escape(v['TG_API_SESSION'])}</textarea>
 <div class=grid><div><label>日志级别</label><input name=LOG_LEVEL value='{html_escape(v['LOG_LEVEL'])}'></div><div><label>面板监听地址</label><input name=WEB_PANEL_HOST value='{html_escape(v['WEB_PANEL_HOST'])}'></div><div><label>面板端口</label><input name=WEB_PANEL_PORT value='{html_escape(v['WEB_PANEL_PORT'])}'></div><div><label>面板用户</label><input name=WEB_PANEL_USER value='{html_escape(v['WEB_PANEL_USER'])}'></div><div><label>面板密码</label><input name=WEB_PANEL_PASSWORD value='{html_escape(v['WEB_PANEL_PASSWORD'])}'></div></div>
 <h3>监控数据自动清理</h3><p class=muted>删除过期监控通知消息，并清理 RSS/网站监控状态和去重记录；不会删除用户、收件箱、双向对话消息。</p><div class=grid><div><label>清理间隔（分钟）</label><input name=CLEANUP_INTERVAL_MINUTES type=number min=1 value='{html_escape(cleanup.get("interval_minutes", 60))}'></div><div><label>监控通知删除时间（分钟）</label><input name=CLEANUP_MESSAGE_DELETE_AFTER_MINUTES type=number min=1 value='{html_escape(cleanup.get("monitor_message_delete_after_minutes", 60))}'></div><div><label>保留监控数据（分钟）</label><input name=CLEANUP_RETENTION_MINUTES type=number min=1 value='{html_escape(cleanup.get("monitor_retention_minutes", 1440))}'></div></div>
 <input type=hidden name=WEB_PANEL_ENABLED value='true'><div class=form-actions><button class='btn primary' type=submit>保存设置</button></div><small>改 Token、管理员 ID 或端口后需要重启。</small></form></div>"""
@@ -1663,7 +2829,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         cfg_save(cfg)
 
     @app.post("/settings", response_class=HTMLResponse)
-    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440)) -> str:
+    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440)) -> str:
         save_panel_settings(locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED}, CLEANUP_INTERVAL_MINUTES, CLEANUP_MESSAGE_DELETE_AFTER_MINUTES, CLEANUP_RETENTION_MINUTES)
         return layout("已保存", "<div class=msg>已保存，不会自动重启；修改 Token/管理员 ID 后请重启。</div><p><a class=btn href='/settings'>返回</a> <a class=btn href='/restart'>重启机器人</a></p>")
 
@@ -1785,13 +2951,16 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         settings_card = f"""<div class=card><h2>Bot / 面板配置</h2><p class=muted>这里和“Bot / 面板设置”共用同一份 .env。修改 Token、管理员 ID、端口、账号或密码后不会自动重启，需要手动重启服务。</p><form method=post action='/users/settings'>
 <label>Telegram Bot Token</label><input name=TELEGRAM_BOT_TOKEN value='{html_escape(v['TELEGRAM_BOT_TOKEN'])}' placeholder='123456:ABC...'>
 <label>管理员 ADMIN_CHAT_ID（最多 3 个，用逗号分隔）</label><input name=ADMIN_CHAT_ID value='{html_escape(v['ADMIN_CHAT_ID'])}'>
+<h3>TG 用户会话（可选）</h3><p class=muted>仅用于 TG 群监听来源=用户会话。修改后需重启。</p>
+<div class=grid><div><label>TG_API_ID</label><input name=TG_API_ID value='{html_escape(v['TG_API_ID'])}'></div><div><label>TG_API_HASH</label><input name=TG_API_HASH value='{html_escape(v['TG_API_HASH'])}'></div></div>
+<label>TG_API_SESSION</label><textarea name=TG_API_SESSION>{html_escape(v['TG_API_SESSION'])}</textarea>
 <div class=grid><div><label>日志级别</label><input name=LOG_LEVEL value='{html_escape(v['LOG_LEVEL'])}'></div><div><label>面板监听地址</label><input name=WEB_PANEL_HOST value='{html_escape(v['WEB_PANEL_HOST'])}'></div><div><label>面板端口</label><input name=WEB_PANEL_PORT value='{html_escape(v['WEB_PANEL_PORT'])}'></div><div><label>面板用户</label><input name=WEB_PANEL_USER value='{html_escape(v['WEB_PANEL_USER'])}'></div><div><label>面板密码</label><input name=WEB_PANEL_PASSWORD value='{html_escape(v['WEB_PANEL_PASSWORD'])}'></div></div>
 <input type=hidden name=WEB_PANEL_ENABLED value='true'><div class=form-actions><button class='btn primary' type=submit>保存配置</button> <a class=btn href='/restart'>重启机器人</a></div></form></div>"""
         body = settings_card + "<div class=card><h2>用户管理</h2><table><tr><th>用户</th><th>状态</th><th>备注</th><th>操作</th></tr>" + "".join(trs) + "</table></div>"
         return layout("用户管理", body)
 
     @app.post("/users/settings", response_class=HTMLResponse)
-    async def users_settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin")) -> str:
+    async def users_settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin")) -> str:
         cleanup = (cfg_load_fresh().get("cleanup") or {})
         save_panel_settings(
             locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED},
@@ -1897,6 +3066,98 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         body = """<div class=card><h2>重启机器人</h2><p class=muted>用于修改 Token、管理员 ID、面板设置等需要重启生效的配置。</p><form method=post action='/restart'><button class='btn danger' type=submit>确认重启 tg-watchbot</button></form></div>"""
         return layout("重启机器人", body)
 
+    @app.get("/update", response_class=HTMLResponse)
+    async def update_page(_: str = Depends(panel_auth)) -> str:
+        repo_dir = BASE_DIR
+        branch = current_git_branch(repo_dir)
+        status_html = ""
+        try:
+            st = git_update_status(repo_dir, branch, fetch_remote=True)
+            rollback = app_meta_get("last_update_rollback")
+            status_html = (
+                "<div class=card><h2>更新状态</h2>"
+                f"<p class=muted>分支：{html_escape(st['branch'])}</p>"
+                f"<p>本地：<code>{html_escape(st['head'][:12])}</code><br>"
+                f"远端：<code>{html_escape(st['remote_head'][:12])}</code><br>"
+                f"ahead: {st['ahead']} / behind: {st['behind']}<br>"
+                f"工作区：{'有未提交改动' if st['dirty'] else '干净'}</p>"
+                f"<p class=muted>上次回滚点：<code>{html_escape((rollback or '-')[:12])}</code></p>"
+                "</div>"
+            )
+        except Exception as e:
+            status_html = f"<div class=card><h2>更新状态</h2><pre>{html_escape(str(e))}</pre></div>"
+        actions = (
+            "<div class=card><h2>更新操作</h2><p class=muted>只允许快进更新（ff-only）。若工作区有本地改动，将拒绝更新。</p>"
+            "<div class=actions>"
+            "<form method=post action='/update' style='display:inline'><button class='btn primary' type=submit>更新并重启</button></form>"
+            "<form method=post action='/update/rollback' style='display:inline'><button class='btn danger' type=submit>回滚上次更新</button></form>"
+            "</div></div>"
+        )
+        return layout("更新代码", status_html + actions)
+
+    @app.post("/update")
+    async def update_post(_: str = Depends(panel_auth)) -> HTMLResponse:
+        repo_dir = BASE_DIR
+        branch = current_git_branch(repo_dir)
+        try:
+            st = git_update_status(repo_dir, branch, fetch_remote=True)
+            if st["dirty"]:
+                return HTMLResponse(
+                    layout(
+                        "更新被拒绝",
+                        "<div class=card><p>检测到本地未提交改动，已拒绝自动更新。请先提交或清理本地改动再试。</p></div><p><a class=btn href='/update'>返回</a></p>",
+                    ),
+                    status_code=400,
+                )
+            if int(st["behind"]) <= 0:
+                return HTMLResponse(layout("无需更新", "<div class=msg>当前已是最新版本，无需重启。</div><p><a class=btn href='/update'>返回</a></p>"))
+            old_head = st["head"]
+            pull = git_run(repo_dir, ["pull", "--ff-only", "origin", branch], check=True)
+            new_head = git_run(repo_dir, ["rev-parse", "HEAD"], check=True).stdout.strip()
+            if new_head != old_head:
+                app_meta_set("last_update_rollback", old_head)
+            logger.info("update applied branch=%s old=%s new=%s out=%s", branch, old_head, new_head, pull.stdout.strip())
+        except subprocess.CalledProcessError as e:
+            logger.exception("update failed")
+            return HTMLResponse(
+                layout(
+                    "更新失败",
+                    f"<div class=card><pre>{html_escape((e.stderr or e.stdout or str(e))[:4000])}</pre></div><p><a class=btn href='/update'>返回</a></p>",
+                ),
+                status_code=500,
+            )
+        except Exception as e:
+            logger.exception("update failed")
+            return HTMLResponse(layout("更新失败", f"<div class=card><pre>{html_escape(str(e))}</pre></div><p><a class=btn href='/update'>返回</a></p>"), status_code=500)
+        async def delayed_restart():
+            await asyncio.sleep(1.0)
+            os._exit(1)
+        asyncio.create_task(delayed_restart())
+        return HTMLResponse(layout("更新完成", "<div class=msg>已拉取最新代码，正在重启。</div><p><a class=btn href='/'>返回首页</a></p>"))
+
+    @app.post("/update/rollback")
+    async def update_rollback_post(_: str = Depends(panel_auth)) -> HTMLResponse:
+        repo_dir = BASE_DIR
+        rollback = app_meta_get("last_update_rollback")
+        if not rollback:
+            return HTMLResponse(layout("回滚失败", "<div class=card><p>没有可用的回滚点。</p></div><p><a class=btn href='/update'>返回</a></p>"), status_code=400)
+        try:
+            if git_run(repo_dir, ["status", "--porcelain"], check=True).stdout.strip():
+                return HTMLResponse(
+                    layout("回滚被拒绝", "<div class=card><p>检测到本地未提交改动，已拒绝回滚。请先处理本地改动再试。</p></div><p><a class=btn href='/update'>返回</a></p>"),
+                    status_code=400,
+                )
+            rollback_to_commit(repo_dir, rollback)
+            logger.info("rollback applied commit=%s", rollback)
+        except Exception as e:
+            logger.exception("rollback failed")
+            return HTMLResponse(layout("回滚失败", f"<div class=card><pre>{html_escape(str(e))}</pre></div><p><a class=btn href='/update'>返回</a></p>"), status_code=500)
+        async def delayed_restart():
+            await asyncio.sleep(1.0)
+            os._exit(1)
+        asyncio.create_task(delayed_restart())
+        return HTMLResponse(layout("回滚完成", "<div class=msg>已回滚并准备重启。</div><p><a class=btn href='/'>返回首页</a></p>"))
+
     @app.post("/restart")
     async def restart_post(_: str = Depends(panel_auth)) -> HTMLResponse:
         async def delayed_restart():
@@ -1949,7 +3210,7 @@ def bot_env_configured() -> bool:
 
 
 async def main_async(run_once: bool = False, panel_only: bool = False) -> None:
-    global bot, admin_chat_id, admin_chat_ids, config, scheduler_ref
+    global bot, admin_chat_id, admin_chat_ids, config, scheduler_ref, user_session_listener_task
     load_dotenv(ENV_PATH, override=True)
     config = load_config()
     setup_logging(os.getenv("LOG_LEVEL", "INFO"))
@@ -1989,6 +3250,15 @@ async def main_async(run_once: bool = False, panel_only: bool = False) -> None:
     scheduler.start()
     asyncio.create_task(flush_pending_loop())
     asyncio.create_task(cleanup_monitor_loop())
+    if group_monitors_need_user_session():
+        if TelegramClient is None:
+            logger.warning("group monitor with listen_source=user_session detected, but telethon is not installed")
+        elif not user_session_ready():
+            logger.warning(
+                "group monitor with listen_source=user_session detected, but TG_API_ID/TG_API_HASH/TG_API_SESSION is not complete"
+            )
+        else:
+            user_session_listener_task = asyncio.create_task(run_user_session_group_listener())
     await admin_send(f"tg-watchbot 已启动\n时间：{now_iso()}")
     logger.info("bot polling start")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())

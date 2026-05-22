@@ -8,3 +8,4 @@ python-dotenv==1.2.1
 python-multipart==0.0.20
 PyYAML==6.0.3
 uvicorn[standard]==0.38.0
+telethon==1.42.0

@@ -301,7 +301,7 @@ class PanelHtmlContractTest(unittest.TestCase):
 
     def test_layout_groups_navigation_by_domain(self) -> None:
         html = app.layout("测试", "<p>ok</p>")
-        for expected in ["<b>消息</b>", "<b>监控</b>", "<b>配置</b>", "<b>系统</b>", "私聊广告拦截"]:
+        for expected in ["<b>消息</b>", "<b>监控</b>", "<b>配置</b>", "<b>系统</b>", "私聊广告拦截", "TG 群监听"]:
             self.assertIn(expected, html)
 
     def test_inbox_copy_describes_two_way_conversation(self) -> None:
@@ -313,6 +313,30 @@ class PanelHtmlContractTest(unittest.TestCase):
         source = Path("app.py").read_text(encoding="utf-8")
         self.assertIn("action='/users/settings'", source)
         self.assertIn("这里和“Bot / 面板设置”共用同一份 .env", source)
+
+    def test_group_monitor_form_keeps_backend_field_names(self) -> None:
+        html = app.group_monitor_form_html()
+        for expected in [
+            "action='/group-monitors/create'",
+            "name=name",
+            "name=chat_id",
+            "name=keywords",
+            "name=exclude_keywords",
+            "name=enabled",
+            "name=notify_telegram",
+            "name=listen_source",
+            "name=summary_mode",
+            "name=ai_interface",
+            "name=ai_base_url",
+            "name=ai_api_key",
+            "name=ai_model",
+            "name=ai_temperature",
+            "name=ai_timeout_seconds",
+            "name=ai_prompt",
+            "name=ai_min_interval_seconds",
+            "name=ai_dedupe_window_seconds",
+        ]:
+            self.assertIn(expected, html)
 
 
 class SpamAndTemplateConfigTest(unittest.TestCase):
@@ -345,6 +369,329 @@ class SpamAndTemplateConfigTest(unittest.TestCase):
             finally:
                 app.CONFIG_PATH = old_config_path
                 app.config = old_config
+
+
+class GroupMonitorTest(unittest.TestCase):
+    def test_ai_api_url_supports_v1_and_plain_base(self) -> None:
+        self.assertEqual("https://api.example.com/v1/responses", app.ai_api_url("https://api.example.com", "/responses"))
+        self.assertEqual("https://api.example.com/v1/chat/completions", app.ai_api_url("https://api.example.com/v1", "/chat/completions"))
+
+    def test_extract_responses_text_and_chat_text(self) -> None:
+        self.assertEqual(
+            "hello",
+            app.extract_responses_text({"output_text": "hello"}),
+        )
+        self.assertEqual(
+            "a\nb",
+            app.extract_responses_text(
+                {"output": [{"content": [{"text": "a"}, {"content": "b"}]}]}
+            ),
+        )
+        self.assertEqual(
+            "ok",
+            app.extract_chat_text({"choices": [{"message": {"content": "ok"}}]}),
+        )
+
+    def test_cfg_save_normalizes_group_monitor_ai_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            old_config_path = app.CONFIG_PATH
+            old_config = app.config
+            old_reload = app.reload_scheduler_jobs
+            app.CONFIG_PATH = Path(temp_dir) / "config.yaml"
+            app.reload_scheduler_jobs = lambda: None
+            try:
+                cfg = {
+                    "monitors": [],
+                    "group_monitors": [
+                        {
+                            "enabled": True,
+                            "chat_id": "-10099",
+                            "keywords": ["vps"],
+                            "exclude_keywords": [],
+                            "summary_mode": "bad-mode",
+                            "ai_interface": "bad-iface",
+                            "ai_temperature": "x",
+                            "ai_timeout_seconds": "0",
+                        }
+                    ],
+                }
+                app.cfg_save(cfg)
+                saved = app.config["group_monitors"][0]
+                self.assertEqual(-10099, saved["chat_id"])
+                self.assertEqual("template", saved["summary_mode"])
+                self.assertEqual("responses", saved["ai_interface"])
+                self.assertEqual("bot", saved["listen_source"])
+                self.assertEqual(0.2, saved["ai_temperature"])
+                self.assertEqual(1, saved["ai_timeout_seconds"])
+                self.assertEqual(app.DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS, saved["ai_min_interval_seconds"])
+                self.assertEqual(app.DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS, saved["ai_dedupe_window_seconds"])
+            finally:
+                app.CONFIG_PATH = old_config_path
+                app.config = old_config
+                app.reload_scheduler_jobs = old_reload
+
+    def test_build_group_ai_system_prompt_allows_custom_prompt(self) -> None:
+        text = app.build_group_ai_system_prompt("请按项目符号输出")
+        self.assertIn("Telegram 群消息摘要助手", text)
+        self.assertIn("请按项目符号输出", text)
+
+    def test_group_monitor_allow_send_applies_interval_and_dedupe(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            old_db_path = app.DB_PATH
+            app.DB_PATH = Path(temp_dir) / "test.sqlite3"
+            app.init_db()
+            monitor = {
+                "name": "测试群",
+                "ai_min_interval_seconds": 30,
+                "ai_dedupe_window_seconds": 120,
+            }
+            try:
+                ok1, reason1 = app.group_monitor_allow_send(monitor, "fp1", now_ts=1000)
+                ok2, reason2 = app.group_monitor_allow_send(monitor, "fp2", now_ts=1010)
+                ok3, reason3 = app.group_monitor_allow_send(monitor, "fp1", now_ts=1040)
+                self.assertTrue(ok1)
+                self.assertEqual("", reason1)
+                self.assertFalse(ok2)
+                self.assertIn("min-interval", reason2)
+                self.assertFalse(ok3)
+                self.assertIn("dedupe", reason3)
+            finally:
+                app.DB_PATH = old_db_path
+
+
+class MonitorRuntimeAndUpdateTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.old_db_path = app.DB_PATH
+        app.DB_PATH = Path(self.temp_dir.name) / "test.sqlite3"
+        app.init_db()
+
+    def tearDown(self) -> None:
+        app.DB_PATH = self.old_db_path
+        self.temp_dir.cleanup()
+
+    def test_record_monitor_runtime_tracks_failures(self) -> None:
+        app.record_monitor_runtime("m1", ok=False, duration_ms=120, sent_count=0, error="oops")
+        app.record_monitor_runtime("m1", ok=False, duration_ms=90, sent_count=0, error="oops2")
+        app.record_monitor_runtime("m1", ok=True, duration_ms=70, sent_count=2)
+        data = app.list_monitor_runtime_status()["m1"]
+        self.assertEqual(0, data["consecutive_failures"])
+        self.assertEqual(2, data["last_sent_count"])
+        self.assertEqual(70, data["last_duration_ms"])
+
+    def test_git_update_status_parses_ahead_behind_and_dirty(self) -> None:
+        old_git_run = app.git_run
+
+        class FakeResult:
+            def __init__(self, out: str):
+                self.stdout = out
+
+        def fake_git_run(repo_dir, args, check=True):
+            cmd = " ".join(args)
+            if cmd.startswith("fetch "):
+                return FakeResult("")
+            if cmd == "rev-parse HEAD":
+                return FakeResult("abc123\n")
+            if cmd == "rev-parse origin/main":
+                return FakeResult("def456\n")
+            if cmd.startswith("rev-list --left-right --count"):
+                return FakeResult("2 5\n")
+            if cmd == "status --porcelain":
+                return FakeResult(" M app.py\n")
+            raise AssertionError(f"unexpected git command: {cmd}")
+
+        app.git_run = fake_git_run
+        try:
+            st = app.git_update_status(Path("."), "main", fetch_remote=True)
+            self.assertEqual("abc123", st["head"])
+            self.assertEqual("def456", st["remote_head"])
+            self.assertEqual(2, st["ahead"])
+            self.assertEqual(5, st["behind"])
+            self.assertTrue(st["dirty"])
+        finally:
+            app.git_run = old_git_run
+
+    def test_group_monitor_for_chat_returns_enabled_target(self) -> None:
+        old_config = app.config
+        app.config = {
+            "group_monitors": [
+                {"enabled": True, "chat_id": -10001, "keywords": ["vps"], "exclude_keywords": []},
+                {"enabled": False, "chat_id": -10002, "keywords": ["api"]},
+            ]
+        }
+        try:
+            monitor = app.group_monitor_for_chat(-10001)
+            self.assertIsNotNone(monitor)
+            self.assertEqual(-10001, monitor["chat_id"])
+            self.assertIsNone(app.group_monitor_for_chat(-10002))
+        finally:
+            app.config = old_config
+
+    def test_group_monitor_for_chat_and_source_returns_matched_monitor(self) -> None:
+        old_config = app.config
+        app.config = {
+            "group_monitors": [
+                {"enabled": True, "chat_id": -10001, "listen_source": "bot", "keywords": ["vps"]},
+                {"enabled": True, "chat_id": -10001, "listen_source": "user_session", "keywords": ["api"]},
+            ]
+        }
+        try:
+            monitor_bot = app.group_monitor_for_chat_and_source(-10001, "bot")
+            monitor_session = app.group_monitor_for_chat_and_source(-10001, "user_session")
+            self.assertIsNotNone(monitor_bot)
+            self.assertIsNotNone(monitor_session)
+            self.assertEqual("bot", monitor_bot["listen_source"])
+            self.assertEqual("user_session", monitor_session["listen_source"])
+        finally:
+            app.config = old_config
+
+    def test_handle_group_keyword_message_sends_summary_to_admin(self) -> None:
+        old_config = app.config
+        old_bot = app.bot
+        old_admin_chat_ids = app.admin_chat_ids
+        fake_bot = FakeBot()
+        app.bot = fake_bot
+        app.admin_chat_ids = [9001]
+        app.config = {
+            "group_monitors": [
+                {
+                    "enabled": True,
+                    "name": "测试群",
+                    "chat_id": -100100100,
+                    "keywords": ["vps", "优惠"],
+                    "exclude_keywords": ["求带"],
+                    "notify_telegram": True,
+                }
+            ]
+        }
+        msg = SimpleNamespace(
+            chat=SimpleNamespace(id=-100100100, username="groupdemo", title="测试群"),
+            from_user=SimpleNamespace(id=123, first_name="Alice", last_name="", username="alice"),
+            text="今晚 vps 有优惠",
+            caption=None,
+            reply_to_message=None,
+            message_id=777,
+            content_type="text",
+        )
+        try:
+            ok = asyncio.run(app.handle_group_keyword_message(msg))
+            self.assertTrue(ok)
+            self.assertEqual([9001], fake_bot.sent_chat_ids)
+            self.assertIn("[群关键词命中]", fake_bot.sent_texts[0])
+            self.assertIn("命中：vps, 优惠", fake_bot.sent_texts[0])
+        finally:
+            app.config = old_config
+            app.bot = old_bot
+            app.admin_chat_ids = old_admin_chat_ids
+
+    def test_handle_group_keyword_message_respects_exclude_keywords(self) -> None:
+        old_config = app.config
+        old_bot = app.bot
+        old_admin_chat_ids = app.admin_chat_ids
+        fake_bot = FakeBot()
+        app.bot = fake_bot
+        app.admin_chat_ids = [9001]
+        app.config = {
+            "group_monitors": [
+                {
+                    "enabled": True,
+                    "chat_id": -100100100,
+                    "keywords": ["vps"],
+                    "exclude_keywords": ["求带"],
+                    "notify_telegram": True,
+                }
+            ]
+        }
+        msg = SimpleNamespace(
+            chat=SimpleNamespace(id=-100100100, username="groupdemo", title="测试群"),
+            from_user=SimpleNamespace(id=123, first_name="Alice", last_name="", username="alice"),
+            text="vps 求带",
+            caption=None,
+            reply_to_message=None,
+            message_id=777,
+            content_type="text",
+        )
+        try:
+            ok = asyncio.run(app.handle_group_keyword_message(msg))
+            self.assertFalse(ok)
+            self.assertEqual([], fake_bot.sent_chat_ids)
+        finally:
+            app.config = old_config
+            app.bot = old_bot
+            app.admin_chat_ids = old_admin_chat_ids
+
+    def test_group_ai_summary_fallback_to_template_when_ai_fails(self) -> None:
+        old_config = app.config
+        old_bot = app.bot
+        old_admin_chat_ids = app.admin_chat_ids
+        old_ai = app.summarize_group_message_ai
+        fake_bot = FakeBot()
+        app.bot = fake_bot
+        app.admin_chat_ids = [9001]
+        app.config = {
+            "group_monitors": [
+                {
+                    "enabled": True,
+                    "name": "测试群",
+                    "chat_id": -100100100,
+                    "keywords": ["vps"],
+                    "exclude_keywords": [],
+                    "notify_telegram": True,
+                    "summary_mode": "ai",
+                    "ai_base_url": "https://api.example.com/v1",
+                    "ai_api_key": "sk-test",
+                    "ai_model": "gpt-4o-mini",
+                    "ai_interface": "responses",
+                }
+            ]
+        }
+
+        async def fail_ai(message, monitor, hits):
+            raise RuntimeError("ai failed")
+
+        app.summarize_group_message_ai = fail_ai
+        msg = SimpleNamespace(
+            chat=SimpleNamespace(id=-100100100, username="groupdemo", title="测试群"),
+            from_user=SimpleNamespace(id=123, first_name="Alice", last_name="", username="alice"),
+            text="今晚 vps 有货",
+            caption=None,
+            reply_to_message=None,
+            message_id=888,
+            content_type="text",
+        )
+        try:
+            ok = asyncio.run(app.handle_group_keyword_message(msg))
+            self.assertTrue(ok)
+            self.assertEqual([9001], fake_bot.sent_chat_ids)
+            self.assertIn("[群AI总结失败，已使用模板]", fake_bot.sent_texts[0])
+            self.assertIn("[群关键词命中]", fake_bot.sent_texts[0])
+        finally:
+            app.config = old_config
+            app.bot = old_bot
+            app.admin_chat_ids = old_admin_chat_ids
+            app.summarize_group_message_ai = old_ai
+
+    def test_record_and_list_discovered_group_chats(self) -> None:
+        msg = SimpleNamespace(
+            chat=SimpleNamespace(id=-100123, type="supergroup", title="测试群A", username="group_a"),
+            text="hello",
+            caption=None,
+            reply_to_message=None,
+            message_id=1,
+            from_user=SimpleNamespace(id=11, first_name="u", last_name="", username="u1"),
+            content_type="text",
+        )
+        app.record_discovered_group_chat(msg)
+        rows = app.list_discovered_group_chats()
+        self.assertTrue(rows)
+        self.assertEqual(-100123, rows[0]["chat_id"])
+        self.assertEqual("测试群A", rows[0]["title"])
+
+    def test_group_monitors_page_keeps_discovered_chat_actions_markup(self) -> None:
+        source = Path("app.py").read_text(encoding="utf-8")
+        self.assertIn("已发现群聊", source)
+        self.assertIn("用此群创建监听", source)
+        self.assertIn("/group-monitors/new?chat_id=", source)
 
 
 if __name__ == "__main__":
