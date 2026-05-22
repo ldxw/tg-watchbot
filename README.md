@@ -117,6 +117,8 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 日志页面和健康检查 `/health`。
 
 ![示例图片](https://pic.gongyichuren.de/file/1779345259571_image.png)
+![新版面板截图](https://pic.gongyichuren.de/file/1779437104636_image.png)
+![新版群监听截图](https://pic.gongyichuren.de/file/1779437050727_image.png)
 
 ## 使用的开源库
 
